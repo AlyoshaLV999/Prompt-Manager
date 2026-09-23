@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prompt-manager"
+version = "2.2.0"
+description = "A local Markdown prompt manager with reusable fixed presets."
+requires-python = ">=3.10"
+dependencies = ["PySide6>=6.6,<7"]
+
+[project.scripts]
+prompt-manager = "prompt_manager.app:main"
+
+[tool.setuptools.packages.find]
+include = ["prompt_manager*"]
