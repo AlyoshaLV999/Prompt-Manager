@@ -107,6 +107,21 @@ class MarkdownEditor(QPlainTextEdit):
         control = Qt.KeyboardModifier.ControlModifier
         alt_shift = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier
 
+        # QCompleter normally filters this event, but with a QPlainTextEdit it
+        # can occasionally reach the editor as well.  Consume it explicitly
+        # so selecting an import with the arrow keys and pressing Enter never
+        # inserts an unintended newline.
+        if self._completer.popup().isVisible() and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            completion = self._completer.currentCompletion()
+            if not completion:
+                index = self._completer.popup().currentIndex()
+                if index.isValid():
+                    completion = str(index.data())
+            if completion:
+                self._complete_import(completion)
+                event.accept()
+                return
+
         if modifiers == control and key == Qt.Key.Key_W:
             self.expand_selection()
             return
@@ -446,8 +461,12 @@ class MarkdownEditor(QPlainTextEdit):
         if self._import_start < 0:
             return
         cursor = self.textCursor()
+        end = cursor.position()
+        if end < self._import_start:
+            self._import_start = -1
+            return
         cursor.setPosition(self._import_start)
-        cursor.setPosition(self.textCursor().position(), QTextCursor.MoveMode.KeepAnchor)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
         cursor.insertText(name)
         self.setTextCursor(cursor)
         self._import_start = -1

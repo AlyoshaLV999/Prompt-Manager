@@ -15,9 +15,22 @@ class Prompt:
     kind: str
     created_at: str
     updated_at: str
+    group_id: int | None = None
+    sort_order: int = 0
+    is_pinned: bool = False
 
     @property
     def is_fixed(self) -> bool:
         """Return whether this item is a reusable fixed preset."""
 
         return self.kind == "fixed"
+
+
+@dataclass(frozen=True, slots=True)
+class PromptGroup:
+    """A first-level group belonging to one prompt category."""
+
+    id: int
+    name: str
+    kind: str
+    sort_order: int = 0
