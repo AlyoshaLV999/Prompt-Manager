@@ -451,6 +451,48 @@ class PromptRepository:
         except sqlite3.Error as exc:
             raise StorageError("保存应用设置失败") from exc
 
+    def backup_database(self) -> Path:
+        """Create a consistent SQLite snapshot in a date-named sibling folder.
+
+        The online backup API includes committed WAL data and does not copy
+        partially written database pages. Repeated backups on the same day
+        atomically replace that day's snapshot.
+
+        :return: Path to the completed backup database.
+        :raises StorageError: If the snapshot cannot be created or verified.
+        """
+
+        backup_directory = self.database_path.parent / datetime.now().strftime("%y-%m-%d")
+        destination = backup_directory / self.database_path.name
+        temporary_path = backup_directory / f".{self.database_path.name}.backup-{uuid4().hex}.tmp"
+        source_connection: sqlite3.Connection | None = None
+        target_connection: sqlite3.Connection | None = None
+        try:
+            backup_directory.mkdir(parents=True, exist_ok=True)
+            source_connection = _readonly_connection(self.database_path)
+            target_connection = sqlite3.connect(temporary_path)
+            source_connection.backup(target_connection, pages=1_000)
+            integrity = target_connection.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or str(integrity[0]).lower() != "ok":
+                raise sqlite3.DatabaseError("备份数据库完整性检查失败")
+            target_connection.close()
+            target_connection = None
+            source_connection.close()
+            source_connection = None
+            temporary_path.replace(destination)
+            return destination
+        except (OSError, sqlite3.Error) as exc:
+            raise StorageError(f"无法备份提示词数据库到: {destination}") from exc
+        finally:
+            if target_connection is not None:
+                target_connection.close()
+            if source_connection is not None:
+                source_connection.close()
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise StorageError(f"无法清理未完成的数据库备份: {temporary_path}") from exc
+
     def close(self) -> None:
         """Close the SQLite connection; safe to call more than once."""
 

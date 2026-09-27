@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
+import logging
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QAbstractItemView, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+    QApplication, QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QKeySequenceEdit, QLineEdit, QListWidget, QListWidgetItem,
     QInputDialog, QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy, QSplitter,
-    QSpinBox, QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QSpinBox, QStackedWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .editor import MarkdownEditor
+from .agent import PROVIDER_DEFAULTS, AgentRequestError, fetch_ollama_models
+from .agent_panel import AgentPanel
 from .models import Prompt
 from .service import PromptService, ValidationError
 from .storage import StorageError
@@ -19,7 +24,8 @@ from .storage import StorageError
 
 APP_STYLESHEET = """
 QMainWindow, QDialog { background: #f5f6fa; color: #1f2430; }
-QFrame#Sidebar, QFrame#EditorCard, QFrame#ToolbarCard, QFrame#FillCard, QFrame#TemporaryCard {
+QFrame#Sidebar, QFrame#EditorCard, QFrame#ToolbarCard, QFrame#FillCard, QFrame#TemporaryCard,
+QWidget#AgentConversationCard {
     background: #ffffff; border: 1px solid #e6e8ef; border-radius: 16px;
 }
 QLabel#AppTitle { font-size: 26px; font-weight: 700; color: #151923; }
@@ -32,6 +38,11 @@ QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus { border: 1px solid #8b7c
 QPushButton, QToolButton {
     border: none; border-radius: 9px; padding: 8px 12px;
     background: #eef0f6; color: #353b4b; font-weight: 600;
+}
+QFrame#SearchReplaceBar {
+    background: #ffffff;
+    border: 1px solid #dfe3eb;
+    border-radius: 10px;
 }
 QPushButton:hover, QToolButton:hover { background: #e2e4ef; }
 QPushButton#PrimaryButton, QToolButton#PrimaryButton { background: #6d5ce7; color: white; }
@@ -56,6 +67,35 @@ DEFAULT_SHORTCUTS = {
     "insert_replace": "Ctrl+Alt+R",
     "insert_import": "Ctrl+Alt+I",
     "settings": "Ctrl+,",
+    "find": "Ctrl+F",
+    "replace": "Ctrl+R",
+    "expand_selection": "Ctrl+W",
+    "copy_line": "Ctrl+C",
+    "cut_line": "Ctrl+X",
+    "move_line_up": "Alt+Shift+Up",
+    "move_line_down": "Alt+Shift+Down",
+    "fold_section": "Ctrl+-",
+    "unfold_section": "Ctrl++",
+    "unfold_section_recursive": "Ctrl+Alt++",
+    "expand_all": "Ctrl+Shift++",
+    "collapse_all": "Ctrl+Shift+-",
+}
+SHORTCUT_LABELS = {
+    "insert_replace": "插入替换占位符",
+    "insert_import": "插入导入占位符",
+    "settings": "打开设置",
+    "find": "查找",
+    "replace": "查找和替换",
+    "expand_selection": "扩展选区",
+    "copy_line": "复制整行（无选区时）",
+    "cut_line": "剪切整行（无选区时）",
+    "move_line_up": "上移当前行",
+    "move_line_down": "下移当前行",
+    "fold_section": "折叠当前段落",
+    "unfold_section": "展开当前段落",
+    "unfold_section_recursive": "递归展开当前段落",
+    "expand_all": "展开全部段落",
+    "collapse_all": "折叠全部段落",
 }
 DEFAULT_ITEM_NAME_MAX_LENGTH = 10
 
@@ -64,6 +104,62 @@ ITEM_TYPE_ROLE = Qt.ItemDataRole.UserRole + 1
 ITEM_PROMPT = "prompt"
 ITEM_GROUP = "group"
 ITEM_SECTION = "section"
+logger = logging.getLogger(__name__)
+
+
+class _DatabaseBackupThread(QThread):
+    """Create an SQLite snapshot away from the GUI thread."""
+
+    completed = Signal(object, str)
+
+    def __init__(self, service: PromptService) -> None:
+        super().__init__()
+        self.service = service
+
+    def run(self) -> None:
+        try:
+            destination = self.service.backup_database()
+        except StorageError as exc:
+            self.completed.emit(None, str(exc))
+        else:
+            self.completed.emit(destination, "")
+
+
+class _ModelFetchThread(QThread):
+    """Query a local Ollama server for its installed models."""
+
+    completed = Signal(object, str)
+
+    def __init__(self, base_url: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.base_url = base_url
+
+    def run(self) -> None:
+        try:
+            models = fetch_ollama_models(self.base_url)
+        except AgentRequestError as exc:
+            self.completed.emit(None, str(exc))
+        else:
+            self.completed.emit(models, "")
+
+
+class _ModelComboBox(QComboBox):
+    """Editable model picker that asks for a refresh whenever its popup opens."""
+
+    refresh_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(24)
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt override
+        """Notify listeners before the popup becomes visible."""
+
+        self.refresh_requested.emit()
+        super().showPopup()
 
 
 def truncate_display_name(name: str, max_length: int) -> str:
@@ -266,16 +362,32 @@ class SectionListRow(QFrame):
 
 
 class FillPromptDialog(QDialog):
-    """Collect replacement values and copy a rendered prompt."""
+    """Collect replacement values and render a prompt for copying or reuse."""
 
-    def __init__(self, service: PromptService, prompt: Prompt, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        service: PromptService,
+        prompt: Prompt,
+        parent: QWidget | None = None,
+        *,
+        accept_text: str = "复制到剪贴板",
+        copy_on_accept: bool = True,
+    ) -> None:
         super().__init__(parent)
         self.service = service
         self.prompt = prompt
+        self._accept_text = accept_text
+        self._copy_on_accept = copy_on_accept
+        self._rendered: str | None = None
         self.fields: dict[str, QTextEdit] = {}
         self.setWindowTitle(f"使用提示词 · {prompt.name}")
         self.setMinimumSize(560, 420)
         self._build_ui()
+
+    def rendered_content(self) -> str | None:
+        """Return the rendered prompt once the dialog has been accepted."""
+
+        return self._rendered
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -283,7 +395,7 @@ class FillPromptDialog(QDialog):
         title = QLabel(self.prompt.name)
         title.setObjectName("AppTitle")
         root.addWidget(title)
-        hint = QLabel("填写以下内容后复制，输入会自动记忆到下次使用。")
+        hint = QLabel("填写以下内容，输入会自动记忆到下次使用。")
         hint.setObjectName("Subtitle")
         root.addWidget(hint)
         card = QFrame()
@@ -303,41 +415,57 @@ class FillPromptDialog(QDialog):
             self.fields[placeholder] = field
         root.addWidget(card, 1)
         buttons = QDialogButtonBox()
-        copy_button = buttons.addButton("复制到剪贴板", QDialogButtonBox.ButtonRole.AcceptRole)
-        copy_button.setObjectName("PrimaryButton")
+        accept_button = buttons.addButton(self._accept_text, QDialogButtonBox.ButtonRole.AcceptRole)
+        accept_button.setObjectName("PrimaryButton")
         cancel_button = buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
-        copy_button.clicked.connect(self._copy)
+        accept_button.clicked.connect(self._accept)
         cancel_button.clicked.connect(self.reject)
         root.addWidget(buttons)
 
-    def _copy(self) -> None:
+    def _accept(self) -> None:
+        """Save values, render the prompt, and optionally copy it to the clipboard."""
+
         values = {title: field.toPlainText() for title, field in self.fields.items()}
         try:
             self.service.save_values(self.prompt.id, values)
-            QApplication.clipboard().setText(self.service.render(self.prompt, values))
-            self.accept()
+            self._rendered = self.service.render(self.prompt, values)
         except StorageError as exc:
             QMessageBox.critical(self, "无法保存输入", str(exc))
+            return
+        if self._copy_on_accept:
+            QApplication.clipboard().setText(self._rendered)
+        self.accept()
 
 
 class SettingsDialog(QDialog):
-    """Edit configurable application shortcuts."""
+    """Edit application shortcuts and OpenAI-compatible Agent settings."""
 
     def __init__(self, service: PromptService, shortcuts: dict[str, str], parent=None) -> None:
         super().__init__(parent)
         self.service = service
         self.shortcut_edits: dict[str, QKeySequenceEdit] = {}
+        self.api_key_value = ""
+        self._model_thread: _ModelFetchThread | None = None
         settings = service.settings()
         try:
             item_name_max_length = int(settings.get("item_name_max_length", DEFAULT_ITEM_NAME_MAX_LENGTH))
         except (TypeError, ValueError):
             item_name_max_length = DEFAULT_ITEM_NAME_MAX_LENGTH
         self.setWindowTitle("设置")
-        self.setMinimumWidth(460)
+        self.setMinimumSize(720, 640)
         root = QVBoxLayout(self)
-        form = QFormLayout()
-        labels = {"insert_replace": "插入替换占位符", "insert_import": "插入导入占位符", "settings": "打开设置"}
-        for key, label in labels.items():
+        body = QHBoxLayout()
+        self.settings_navigation = QListWidget()
+        self.settings_navigation.setFixedWidth(130)
+        self.settings_navigation.addItems(["快捷键", "Agent 设置"])
+        self.settings_pages = QStackedWidget()
+        body.addWidget(self.settings_navigation)
+        body.addWidget(self.settings_pages, 1)
+        root.addLayout(body, 1)
+
+        shortcuts_page = QWidget()
+        form = QFormLayout(shortcuts_page)
+        for key, label in SHORTCUT_LABELS.items():
             edit = QKeySequenceEdit(QKeySequence(shortcuts.get(key, DEFAULT_SHORTCUTS[key])))
             form.addRow(label, edit)
             self.shortcut_edits[key] = edit
@@ -347,25 +475,139 @@ class SettingsDialog(QDialog):
         self.item_name_length_edit.setSuffix(" 个字符")
         self.item_name_length_edit.setToolTip("导航栏中条目和分组名称超过此长度时显示省略号")
         form.addRow("名称显示长度", self.item_name_length_edit)
-        root.addLayout(form)
-        tip = QLabel("快捷键会自动保存到本地设置；编辑器折叠快捷键遵循 Ctrl + / Ctrl -。\n"
-                     "Ctrl W 扩选，Ctrl C/X 复制或剪切整行，Alt Shift ↑/↓ 交换相邻行。")
+        shortcuts_tip = QLabel("编辑器快捷键仅在编辑内容区域获得焦点时生效。")
+        shortcuts_tip.setObjectName("Hint")
+        shortcuts_tip.setWordWrap(True)
+        form.addRow(shortcuts_tip)
+        self.settings_pages.addWidget(shortcuts_page)
+
+        agent_page = QWidget()
+        agent_form = QFormLayout(agent_page)
+        self.agent_provider_edit = QComboBox()
+        self.agent_provider_edit.addItem("OpenAI", "openai")
+        self.agent_provider_edit.addItem("Ollama", "ollama")
+        self.agent_provider_edit.addItem("Gemini", "gemini")
+        provider = settings.get("agent_provider", "openai")
+        if provider not in PROVIDER_DEFAULTS:
+            provider = "openai"
+        provider_index = self.agent_provider_edit.findData(provider)
+        self.agent_provider_edit.setCurrentIndex(max(0, provider_index))
+        agent_form.addRow("服务商", self.agent_provider_edit)
+        self.agent_base_url_edit = QLineEdit(settings.get("agent_base_url", PROVIDER_DEFAULTS[provider][0]))
+        self.agent_base_url_edit.setPlaceholderText("OpenAI 兼容 API 基础地址")
+        agent_form.addRow("API 地址", self.agent_base_url_edit)
+        self.agent_model_edit = _ModelComboBox()
+        self.agent_model_edit.setCurrentText(settings.get("agent_model", PROVIDER_DEFAULTS[provider][1]))
+        line_edit = self.agent_model_edit.lineEdit()
+        if line_edit is not None:
+            line_edit.setPlaceholderText("模型名称（可直接输入或从下拉列表选择）")
+        self.agent_model_edit.setToolTip(
+            "选择 Ollama 服务商时，展开下拉框会自动获取本地已安装的模型列表；"
+            "其他服务商仍可直接输入模型名称。"
+        )
+        self.agent_model_edit.refresh_requested.connect(self._refresh_agent_models)
+        agent_form.addRow("模型", self.agent_model_edit)
+        self._agent_provider = provider
+        self.agent_provider_edit.currentIndexChanged.connect(self._update_agent_provider_defaults)
+        self.agent_api_key_edit = QLineEdit()
+        self.agent_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.agent_api_key_edit.setPlaceholderText("留空时读取 OPENAI_API_KEY 或 GEMINI_API_KEY")
+        agent_form.addRow("API Key（本次运行）", self.agent_api_key_edit)
+        tip = QLabel(
+            "API Key 只保存在本次运行内，不写入本地数据库。Gemini 使用 OpenAI 兼容接口。"
+            "Ollama 模型列表通过本机 /api/tags 获取，需要本地服务已启动。"
+        )
         tip.setObjectName("Hint")
         tip.setWordWrap(True)
-        root.addWidget(tip)
+        agent_form.addRow(tip)
+        self.settings_pages.addWidget(agent_page)
+        self.settings_navigation.currentRowChanged.connect(self.settings_pages.setCurrentIndex)
+        self.settings_navigation.setCurrentRow(0)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
+    def _update_agent_provider_defaults(self) -> None:
+        """Keep default endpoint and model aligned with a provider change."""
+
+        provider = str(self.agent_provider_edit.currentData())
+        old_url, old_model = PROVIDER_DEFAULTS[self._agent_provider]
+        new_url, new_model = PROVIDER_DEFAULTS[provider]
+        if self.agent_base_url_edit.text().strip() == old_url:
+            self.agent_base_url_edit.setText(new_url)
+        if self.agent_model_edit.currentText().strip() == old_model:
+            self.agent_model_edit.setCurrentText(new_model)
+        self._agent_provider = provider
+        if provider == "ollama":
+            self._refresh_agent_models()
+
+    def _refresh_agent_models(self) -> None:
+        """Fetch Ollama model names in the background when that provider is active."""
+
+        if str(self.agent_provider_edit.currentData()) != "ollama":
+            return
+        if self._model_thread is not None and self._model_thread.isRunning():
+            return
+        base_url = self.agent_base_url_edit.text().strip()
+        thread = _ModelFetchThread(base_url, self)
+        thread.completed.connect(self._on_agent_models_fetched)
+        thread.finished.connect(self._on_model_thread_finished)
+        self._model_thread = thread
+        thread.start()
+
+    def _on_agent_models_fetched(self, models: object, error: str) -> None:
+        """Replace the combo box entries with detected models, preserving user input."""
+
+        if error:
+            logger.warning("Ollama 模型列表获取失败: %s", error)
+            return
+        if not isinstance(models, list) or not models:
+            return
+        combo = self.agent_model_edit
+        current_text = combo.currentText().strip()
+        names = [str(model) for model in models]
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentText(current_text or names[0])
+        finally:
+            combo.blockSignals(False)
+
+    def _on_model_thread_finished(self) -> None:
+        thread = self.sender()
+        if thread is self._model_thread:
+            self._model_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
     def _save(self) -> None:
         values = {key: edit.keySequence().toString() for key, edit in self.shortcut_edits.items()}
+        configured: dict[str, str] = {}
+        for key, sequence in values.items():
+            normalized = QKeySequence(sequence).toString()
+            if not normalized:
+                continue
+            previous = configured.get(normalized)
+            if previous is not None:
+                QMessageBox.warning(
+                    self,
+                    "快捷键重复",
+                    f"“{SHORTCUT_LABELS[previous]}”和“{SHORTCUT_LABELS[key]}”使用了相同快捷键。",
+                )
+                return
+            configured[normalized] = key
         values["item_name_max_length"] = str(self.item_name_length_edit.value())
+        values["agent_provider"] = str(self.agent_provider_edit.currentData())
+        values["agent_base_url"] = self.agent_base_url_edit.text().strip()
+        values["agent_model"] = self.agent_model_edit.currentText().strip()
         try:
             self.service.save_settings(values)
         except StorageError as exc:
             QMessageBox.critical(self, "保存设置失败", str(exc))
             return
+        self.api_key_value = self.agent_api_key_edit.text().strip()
         self.accept()
 
 
@@ -395,6 +637,7 @@ class MainWindow(QMainWindow):
         self.resize(1260, 820)
         self.setStyleSheet(APP_STYLESHEET)
         self._build_ui()
+        self._backup_thread: _DatabaseBackupThread | None = None
         self._install_shortcuts()
         self.refresh_prompt_list()
 
@@ -419,12 +662,12 @@ class MainWindow(QMainWindow):
         settings_button.clicked.connect(self.open_settings)
         use_button = QPushButton("使用提示词")
         use_button.clicked.connect(self.use_current_prompt)
-        new_button = QPushButton("新建")
-        new_button.setObjectName("PrimaryButton")
-        new_button.clicked.connect(self.new_prompt)
+        self.agent_button = QPushButton("Agent")
+        self.agent_button.setCheckable(True)
+        self.agent_button.clicked.connect(self.open_agent)
         toolbar_layout.addWidget(settings_button)
         toolbar_layout.addWidget(use_button)
-        toolbar_layout.addWidget(new_button)
+        toolbar_layout.addWidget(self.agent_button)
         root.addWidget(toolbar)
 
         category_bar = QHBoxLayout()
@@ -471,7 +714,17 @@ class MainWindow(QMainWindow):
         self.temporary_text_button.setCheckable(True)
         self.temporary_text_button.setToolTip("打开或关闭持久保存的临时文本面板")
         self.temporary_text_button.clicked.connect(self.toggle_temporary_text)
-        side_layout.addWidget(self.temporary_text_button)
+        new_button = QPushButton("新建")
+        new_button.setObjectName("PrimaryButton")
+        new_button.setToolTip("新建当前类别的条目")
+        new_button.clicked.connect(self.new_prompt)
+        # Share the bottom row equally: the temporary-text button keeps about
+        # half of its previous width while the new-entry button fits beside it.
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(8)
+        bottom_row.addWidget(self.temporary_text_button, 1)
+        bottom_row.addWidget(new_button, 1)
+        side_layout.addLayout(bottom_row)
         columns.addWidget(sidebar)
 
         editor = QFrame()
@@ -526,7 +779,7 @@ class MainWindow(QMainWindow):
         self.editing_splitter.setSizes([1080, 900])
         editor_layout.addWidget(self.editing_splitter, 1)
         editor_layout.addLayout(self._build_format_toolbar())
-        hint = QLabel("修改会自动保存。Ctrl W 扩选；Ctrl C/X 复制或剪切整行；Alt Shift ↑/↓ 移动行；Ctrl + / Ctrl - 折叠。")
+        hint = QLabel("修改会自动保存。编辑器快捷键可在设置中查看和修改。")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         editor_layout.addWidget(hint)
@@ -552,6 +805,9 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.autosave_label)
         editor_layout.addLayout(actions)
         columns.addWidget(editor, 1)
+        self.agent_panel = AgentPanel(self)
+        columns.addWidget(self.agent_panel)
+        self.agent_panel.setVisible(False)
         root.addLayout(columns, 1)
         self.setCentralWidget(central)
 
@@ -609,17 +865,49 @@ class MainWindow(QMainWindow):
     def _install_shortcuts(self) -> None:
         settings = DEFAULT_SHORTCUTS | self.service.settings()
         for shortcut in self._shortcuts:
+            shortcut.setEnabled(False)
             shortcut.deleteLater()
         self._shortcuts = []
-        for key, callback in (
-            ("insert_replace", lambda: self.insert_marker("replace")),
-            ("insert_import", lambda: self.insert_marker("import")),
-            ("settings", self.open_settings),
-        ):
-            shortcut = QShortcut(QKeySequence(settings[key]), self)
-            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        global_actions = {
+            "insert_replace": lambda: self.insert_marker("replace"),
+            "insert_import": lambda: self.insert_marker("import"),
+            "settings": self.open_settings,
+        }
+        editor_actions = {
+            "find": self.content_edit.open_find_bar,
+            "replace": self.content_edit.open_replace_bar,
+            "expand_selection": self.content_edit.expand_selection,
+            "copy_line": lambda: self._copy_or_cut_editor_line(False),
+            "cut_line": lambda: self._copy_or_cut_editor_line(True),
+            "move_line_up": lambda: self.content_edit.move_current_line(-1),
+            "move_line_down": lambda: self.content_edit.move_current_line(1),
+            "fold_section": self.content_edit.collapse_section,
+            "unfold_section": lambda: self.content_edit.expand_section(recursive=False),
+            "unfold_section_recursive": lambda: self.content_edit.expand_section(recursive=True),
+            "expand_all": self.content_edit.expand_all,
+            "collapse_all": self.content_edit.collapse_all,
+        }
+        for key, callback in (global_actions | editor_actions).items():
+            sequence_text = settings.get(key, DEFAULT_SHORTCUTS[key])
+            if not sequence_text.strip():
+                continue
+            parent = self if key in global_actions else self.content_edit
+            shortcut = QShortcut(QKeySequence(sequence_text), parent)
+            shortcut.setContext(
+                Qt.ShortcutContext.WindowShortcut
+                if key in global_actions
+                else Qt.ShortcutContext.WidgetWithChildrenShortcut
+            )
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
+
+    def _copy_or_cut_editor_line(self, cut: bool) -> None:
+        """Keep normal selected-text copy behavior and edit whole lines otherwise."""
+
+        if self.content_edit.textCursor().hasSelection():
+            (self.content_edit.cut if cut else self.content_edit.copy)()
+            return
+        self.content_edit._copy_or_cut_current_line(cut)
 
     def toggle_temporary_text(self) -> None:
         """Show or hide the persistent temporary-text editor."""
@@ -883,16 +1171,46 @@ class MainWindow(QMainWindow):
             self._show_error(str(exc))
 
     def optimize_current_prompt(self, with_file: bool) -> None:
-        """Copy an optimization instruction plus the current editor text."""
+        """Render the current prompt through the fill dialog, then copy an optimization request.
 
-        content = self.content_edit.toPlainText()
-        if not content.strip():
-            self._show_error("编辑内容为空，无法优化提示词")
+        The optimization instruction is prepended to the *rendered* prompt, so
+        placeholders and imports are resolved before the text is sent to an
+        external model.  Without this step the clipboard would contain raw
+        ``=====REPLACE: ...=====`` / ``=====IMPORT: ...=====`` markers.
+        """
+
+        if self.current_prompt_id is None:
+            self._show_error("请先选择或输入一个提示词")
+            return
+        self._autosave_timer.stop()
+        self._auto_save()
+        prompt = self.service.get_prompt(self.current_prompt_id)
+        if prompt is None:
+            self._show_error("提示词已不存在，请刷新后重试")
             return
         instruction = (
             "请你根据我发给你的文件内容，帮我优化以下提示词，并以text格式交付我"
             if with_file else "请你帮我优化以下提示词，并以text格式交付我"
         )
+        try:
+            if self.service.placeholders_for(prompt):
+                dialog = FillPromptDialog(
+                    self.service,
+                    prompt,
+                    self,
+                    accept_text="生成优化指令",
+                    copy_on_accept=False,
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                content = dialog.rendered_content()
+                if content is None:
+                    return
+            else:
+                content = self.service.render(prompt, {})
+        except (ValidationError, StorageError) as exc:
+            self._show_error(str(exc))
+            return
         self._copy_to_clipboard(f"{instruction}\n{content}", "优化提示词已复制到剪贴板")
 
     def _select_prompt(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
@@ -991,11 +1309,204 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.service, DEFAULT_SHORTCUTS | self.service.settings(), self)
+        dialog.agent_api_key_edit.setText(getattr(self, "_agent_api_key", ""))
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._agent_api_key = dialog.api_key_value
             self.item_name_max_length = self._read_item_name_max_length(self.service.settings())
             self._install_shortcuts()
             self.refresh_prompt_list(select_id=self.current_prompt_id, load_selection=False)
             self.statusBar().showMessage("设置已保存", 2500)
+
+    def open_agent(self) -> None:
+        """Toggle the embedded Agent panel beside the editor."""
+
+        visible = self.agent_button.isChecked()
+        self.agent_panel.setVisible(visible)
+        self.agent_button.setChecked(visible)
+        if visible:
+            self.agent_panel.input_edit.setFocus()
+
+    def start_database_backup(self) -> None:
+        """Back up the live database without blocking the interface."""
+
+        if self._backup_thread is not None:
+            return
+        self.agent_panel.backup_button.setEnabled(False)
+        self.agent_panel.status_label.setText("正在备份数据库…")
+        self._backup_thread = _DatabaseBackupThread(self.service)
+        self._backup_thread.completed.connect(self._on_database_backup_completed)
+        self._backup_thread.finished.connect(self._on_database_backup_thread_finished)
+        self._backup_thread.start()
+
+    def _on_database_backup_completed(self, destination: object, error: str) -> None:
+        if error:
+            logger.warning("Database backup failed: %s", error)
+            message = f"数据库备份失败：{error}"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 6000)
+            return
+        if not isinstance(destination, Path):
+            logger.error("Database backup worker returned an invalid destination")
+            self.agent_panel.status_label.setText("数据库备份失败：未返回备份路径")
+            return
+        backup_path = Path(destination)
+        message = f"备份完成：{backup_path.parent.name}/{backup_path.name}"
+        self.agent_panel.status_label.setText(message)
+        self.statusBar().showMessage(f"数据库已备份到：{backup_path}", 6000)
+
+    def _on_database_backup_thread_finished(self) -> None:
+        thread = self.sender()
+        self._backup_thread = None
+        self.agent_panel.backup_button.setEnabled(True)
+        if thread is not None:
+            thread.deleteLater()
+
+    def execute_agent_tool(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Run one allow-listed Agent action on the GUI thread.
+
+        :param name: Tool name returned by the configured model.
+        :param arguments: JSON object validated against the tool's required fields.
+        :return: JSON-serializable action result or a user-readable error.
+        """
+
+        try:
+            if name == "list_prompts":
+                kind = arguments.get("kind")
+                prompts = self.service.list_prompts(str(kind) if kind is not None else None)
+                return {
+                    "prompts": [
+                        {
+                            "id": prompt.id,
+                            "name": prompt.name,
+                            "kind": prompt.kind,
+                            "group_id": prompt.group_id,
+                            "is_pinned": prompt.is_pinned,
+                            "updated_at": prompt.updated_at,
+                        }
+                        for prompt in prompts
+                    ]
+                }
+            if name == "read_prompt":
+                prompt = self.service.get_prompt(int(arguments["prompt_id"]))
+                if prompt is None:
+                    return {"error": "未找到该提示词"}
+                return {
+                    "id": prompt.id,
+                    "name": prompt.name,
+                    "content": prompt.content,
+                    "kind": prompt.kind,
+                    "group_id": prompt.group_id,
+                    "is_pinned": prompt.is_pinned,
+                }
+            if name == "create_prompt":
+                prompt = self.service.create_prompt(str(arguments["name"]), str(arguments["content"]),
+                                                    str(arguments["kind"]))
+                self._focus_agent_prompt(prompt)
+                return {
+                    "created": True,
+                    "id": prompt.id,
+                    "name": prompt.name,
+                    "kind": prompt.kind,
+                    "group_id": prompt.group_id,
+                }
+            if name == "update_prompt":
+                prompt = self.service.update_prompt(int(arguments["prompt_id"]), str(arguments["name"]),
+                                                    str(arguments["content"]), str(arguments["kind"]))
+                self._focus_agent_prompt(prompt)
+                return {
+                    "updated": True,
+                    "id": prompt.id,
+                    "name": prompt.name,
+                    "kind": prompt.kind,
+                    "group_id": prompt.group_id,
+                }
+            if name == "delete_prompt":
+                prompt_id = int(arguments["prompt_id"])
+                if self.service.get_prompt(prompt_id) is None:
+                    return {"error": "未找到该提示词"}
+                self.service.delete_prompt(prompt_id)
+                self.refresh_prompt_list()
+                return {"deleted": True, "id": prompt_id}
+            if name == "select_prompt":
+                prompt = self.service.get_prompt(int(arguments["prompt_id"]))
+                if prompt is None:
+                    return {"error": "未找到该提示词"}
+                self._focus_agent_prompt(prompt)
+                return {"selected": True, "id": prompt.id, "name": prompt.name}
+            if name == "list_groups":
+                kind = str(arguments["kind"])
+                groups = self.service.list_groups(kind)
+                prompts = self.service.list_prompts(kind)
+                counts: dict[int, int] = {}
+                for prompt in prompts:
+                    if prompt.group_id is not None and not prompt.is_pinned:
+                        counts[prompt.group_id] = counts.get(prompt.group_id, 0) + 1
+                return {
+                    "groups": [
+                        {
+                            "id": group.id,
+                            "name": group.name,
+                            "kind": group.kind,
+                            "sort_order": group.sort_order,
+                            "prompt_count": counts.get(group.id, 0),
+                        }
+                        for group in groups
+                    ]
+                }
+            if name == "create_group":
+                group = self.service.create_group(str(arguments["name"]), str(arguments["kind"]))
+                if group.kind == self.current_kind:
+                    self.refresh_prompt_list(select_id=self.current_prompt_id, load_selection=False)
+                return {
+                    "created": True,
+                    "id": group.id,
+                    "name": group.name,
+                    "kind": group.kind,
+                }
+            if name == "set_prompt_group":
+                prompt_id = int(arguments["prompt_id"])
+                group_id = int(arguments["group_id"])
+                self.service.set_prompt_group(prompt_id, group_id)
+                prompt = self.service.get_prompt(prompt_id)
+                if prompt is None:
+                    return {"error": "未找到该提示词"}
+                self._focus_agent_prompt(prompt)
+                return {
+                    "updated": True,
+                    "id": prompt.id,
+                    "name": prompt.name,
+                    "kind": prompt.kind,
+                    "group_id": prompt.group_id,
+                }
+            if name == "clear_prompt_group":
+                prompt_id = int(arguments["prompt_id"])
+                prompt = self.service.get_prompt(prompt_id)
+                if prompt is None:
+                    return {"error": "未找到该提示词"}
+                self.service.set_prompt_group(prompt_id, None)
+                prompt = self.service.get_prompt(prompt_id)
+                if prompt is None:
+                    return {"error": "未找到该提示词"}
+                self._focus_agent_prompt(prompt)
+                return {
+                    "updated": True,
+                    "id": prompt.id,
+                    "name": prompt.name,
+                    "kind": prompt.kind,
+                    "group_id": None,
+                }
+            return {"error": f"未知工具: {name}"}
+        except (KeyError, TypeError, ValueError, ValidationError, StorageError) as exc:
+            return {"error": str(exc)}
+
+    def _focus_agent_prompt(self, prompt: Prompt) -> None:
+        """Switch to an Agent-selected prompt and expand its group if needed."""
+
+        if prompt.kind != self.current_kind:
+            self.switch_category(prompt.kind)
+        if prompt.group_id is not None:
+            self._collapsed_group_ids[prompt.group_id] = False
+        self.refresh_prompt_list(select_id=prompt.id)
 
     def delete_current_prompt(self) -> None:
         if self.current_prompt_id is None:
@@ -1051,6 +1562,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
         """Flush debounced edits before the repository is closed by the app."""
 
+        if self._backup_thread is not None and self._backup_thread.isRunning():
+            self._backup_thread.wait()
         self._autosave_timer.stop()
         self._temporary_autosave_timer.stop()
         self._auto_save()

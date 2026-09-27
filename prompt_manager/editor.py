@@ -5,13 +5,34 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-from PySide6.QtCore import Qt, QStringListModel, Signal
-from PySide6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextFormat
-from PySide6.QtWidgets import QApplication, QCompleter, QPlainTextEdit, QTextEdit
+from PySide6.QtCore import QEvent, Qt, QStringListModel, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QSyntaxHighlighter,
+    QTextCharFormat,
+    QTextCursor,
+    QTextFormat,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCompleter,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QTextEdit,
+    QToolButton,
+)
 
 
 HEADING_RE = re.compile(r"^(\s{0,3})(#{1,6})(?:\s+|$)")
 IMPORT_INPUT_RE = re.compile(r"=====IMPORT:\s*([^=\n]*)$")
+
+SEARCH_MATCH_COLOR = "#fff3b0"
+SEARCH_CURRENT_COLOR = "#ffb86b"
+SEARCH_CURRENT_TEXT_COLOR = "#1f2430"
 
 
 def chinese_initials(value: str) -> str:
@@ -73,6 +94,247 @@ class MarkdownHighlighter(QSyntaxHighlighter):
                 self.setFormat(match.start(), match.end() - match.start(), format_)
 
 
+class SearchReplaceBar(QFrame):
+    """Inline find/replace panel attached to a :class:`MarkdownEditor`."""
+
+    def __init__(self, editor: "MarkdownEditor") -> None:
+        super().__init__(editor)
+        self._editor = editor
+        self._matches: list[QTextCursor] = []
+        self._current_index = -1
+        self.setObjectName("SearchReplaceBar")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setVisible(False)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(4)
+
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("查找")
+        self.search_field.setClearButtonEnabled(True)
+        self.search_field.setMinimumWidth(140)
+        self.search_field.textChanged.connect(self._refresh_matches)
+        self.search_field.installEventFilter(self)
+
+        self.counter_label = QLabel("")
+        self.counter_label.setObjectName("Meta")
+        self.counter_label.setMinimumWidth(48)
+        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.previous_button = QToolButton()
+        self.previous_button.setText("↑")
+        self.previous_button.setToolTip("上一个匹配 (Shift+Enter)")
+        self.previous_button.clicked.connect(self.find_previous)
+
+        self.next_button = QToolButton()
+        self.next_button.setText("↓")
+        self.next_button.setToolTip("下一个匹配 (Enter)")
+        self.next_button.clicked.connect(self.find_next)
+
+        self.replace_field = QLineEdit()
+        self.replace_field.setPlaceholderText("替换为")
+        self.replace_field.setClearButtonEnabled(True)
+        self.replace_field.setMinimumWidth(140)
+
+        self.replace_button = QToolButton()
+        self.replace_button.setText("替换")
+        self.replace_button.setToolTip("替换当前匹配")
+        self.replace_button.clicked.connect(self.replace_current)
+
+        self.replace_all_button = QToolButton()
+        self.replace_all_button.setText("全部替换")
+        self.replace_all_button.setToolTip("替换所有匹配")
+        self.replace_all_button.clicked.connect(self.replace_all)
+
+        self.close_button = QToolButton()
+        self.close_button.setText("✕")
+        self.close_button.setToolTip("关闭 (Esc)")
+        self.close_button.clicked.connect(self.close_bar)
+
+        layout.addWidget(self.search_field)
+        layout.addWidget(self.counter_label)
+        layout.addWidget(self.previous_button)
+        layout.addWidget(self.next_button)
+        layout.addWidget(self.replace_field)
+        layout.addWidget(self.replace_button)
+        layout.addWidget(self.replace_all_button)
+        layout.addWidget(self.close_button)
+
+        self._replace_widgets = (
+            self.replace_field,
+            self.replace_button,
+            self.replace_all_button,
+        )
+        self._set_replace_visible(False)
+
+    def open_for(self, *, replace: bool) -> None:
+        """Show the bar, optionally revealing the replacement controls."""
+
+        self._set_replace_visible(replace)
+        self.adjustSize()
+        self.show()
+        self.reposition()
+        cursor = self._editor.textCursor()
+        if cursor.hasSelection() and "\u2029" not in cursor.selectedText():
+            self.search_field.setText(cursor.selectedText())
+        self.search_field.setFocus()
+        self.search_field.selectAll()
+        self._refresh_matches()
+
+    def close_bar(self) -> None:
+        """Hide the bar and drop search highlights."""
+
+        self.hide()
+        self._matches = []
+        self._current_index = -1
+        self._editor.set_search_highlights([], -1)
+        self._editor.setFocus()
+
+    def refresh_matches(self) -> None:
+        """Recompute matches after the document changed."""
+
+        self._refresh_matches(preserve_index=True)
+
+    def reposition(self) -> None:
+        """Place the bar in the editor's top-right corner."""
+
+        editor_width = self._editor.width()
+        if editor_width <= 0:
+            return
+        hint = self.sizeHint()
+        max_width = max(320, editor_width - 24)
+        width = min(hint.width(), max_width)
+        self.resize(width, hint.height())
+        self.move(max(12, editor_width - width - 12), 8)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt override
+        """Route Escape / Enter / Shift+Enter while the search field has focus."""
+
+        if obj is self.search_field and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self.close_bar()
+                return True
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.find_previous()
+                else:
+                    self.find_next()
+                return True
+        return super().eventFilter(obj, event)
+
+    def find_next(self) -> None:
+        """Select the next match, wrapping around the document end."""
+
+        if not self._matches:
+            self._refresh_matches()
+            if not self._matches:
+                return
+        if self._current_index < 0:
+            self._current_index = 0
+        else:
+            self._current_index = (self._current_index + 1) % len(self._matches)
+        self._apply_current_match()
+
+    def find_previous(self) -> None:
+        """Select the previous match, wrapping around the document start."""
+
+        if not self._matches:
+            self._refresh_matches()
+            if not self._matches:
+                return
+        if self._current_index < 0:
+            self._current_index = len(self._matches) - 1
+        else:
+            self._current_index = (self._current_index - 1) % len(self._matches)
+        self._apply_current_match()
+
+    def replace_current(self) -> None:
+        """Replace the selected match and select the following one."""
+
+        if not self._matches or not (0 <= self._current_index < len(self._matches)):
+            return
+        replacement = self.replace_field.text()
+        match = self._matches[self._current_index]
+        replacement_end = match.selectionStart() + len(replacement)
+        cursor = QTextCursor(self._editor.document())
+        cursor.setPosition(match.selectionStart())
+        cursor.setPosition(match.selectionEnd(), QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(replacement)
+        self._refresh_matches()
+        if not self._matches:
+            return
+        self._current_index = 0
+        for index, candidate in enumerate(self._matches):
+            if candidate.selectionStart() >= replacement_end:
+                self._current_index = index
+                break
+        self._apply_current_match()
+
+    def replace_all(self) -> None:
+        """Replace every match in one undoable edit block."""
+
+        text = self.search_field.text()
+        if not text:
+            return
+        matches = self._editor.find_all(text)
+        if not matches:
+            return
+        replacement = self.replace_field.text()
+        cursor = QTextCursor(self._editor.document())
+        cursor.beginEditBlock()
+        try:
+            # Replace back-to-front so earlier matches keep their positions.
+            for match in reversed(matches):
+                replace_cursor = QTextCursor(self._editor.document())
+                replace_cursor.setPosition(match.selectionStart())
+                replace_cursor.setPosition(match.selectionEnd(), QTextCursor.MoveMode.KeepAnchor)
+                replace_cursor.insertText(replacement)
+        finally:
+            cursor.endEditBlock()
+        self._refresh_matches()
+
+    def _set_replace_visible(self, visible: bool) -> None:
+        for widget in self._replace_widgets:
+            widget.setVisible(visible)
+
+    def _refresh_matches(self, preserve_index: bool = False) -> None:
+        text = self.search_field.text()
+        previous = self._current_index
+        self._matches = self._editor.find_all(text) if text else []
+        if not self._matches:
+            self._current_index = -1
+        elif preserve_index and 0 <= previous < len(self._matches):
+            self._current_index = previous
+        else:
+            self._current_index = 0
+        self._editor.set_search_highlights(self._matches, self._current_index)
+        self._update_counter()
+
+    def _apply_current_match(self) -> None:
+        if not self._matches:
+            self._editor.set_search_highlights([], -1)
+            self._update_counter()
+            return
+        if not (0 <= self._current_index < len(self._matches)):
+            self._current_index = 0
+        match = self._matches[self._current_index]
+        cursor = QTextCursor(self._editor.document())
+        cursor.setPosition(match.selectionStart())
+        self._editor.setTextCursor(cursor)
+        self._editor.ensureCursorVisible()
+        self._editor.set_search_highlights(self._matches, self._current_index)
+        self._update_counter()
+
+    def _update_counter(self) -> None:
+        if not self._matches:
+            self.counter_label.setText("0/0" if self.search_field.text() else "")
+            return
+        self.counter_label.setText(f"{self._current_index + 1}/{len(self._matches)}")
+
+
 class MarkdownEditor(QPlainTextEdit):
     """Plain-text Markdown editor with folding and IDE-like keyboard actions."""
 
@@ -92,7 +354,43 @@ class MarkdownEditor(QPlainTextEdit):
         self._completer.activated.connect(self._complete_import)
         self._import_start = -1
         self._import_candidates: list[str] = []
-        self.document().contentsChanged.connect(self._update_fold_markers)
+        self._search_matches: list[QTextCursor] = []
+        self._current_search_index = -1
+        self._search_bar = SearchReplaceBar(self)
+        self.document().contentsChanged.connect(self._on_document_changed)
+
+    def open_find_bar(self) -> None:
+        """Show the inline find bar and focus its search field."""
+
+        self._search_bar.open_for(replace=False)
+
+    def open_replace_bar(self) -> None:
+        """Show the inline replace bar and focus its search field."""
+
+        self._search_bar.open_for(replace=True)
+
+    def find_all(self, text: str) -> list[QTextCursor]:
+        """Return cursors for every non-overlapping occurrence of ``text``."""
+
+        if not text:
+            return []
+        matches: list[QTextCursor] = []
+        document = self.document()
+        cursor = QTextCursor(document)
+        while True:
+            match = document.find(text, cursor)
+            if match.isNull():
+                break
+            matches.append(match)
+            cursor.setPosition(match.selectionEnd())
+        return matches
+
+    def set_search_highlights(self, matches: list[QTextCursor], current_index: int) -> None:
+        """Update the highlight overlays used by the find bar."""
+
+        self._search_matches = matches
+        self._current_search_index = current_index
+        self._update_extra_selections()
 
     def set_import_candidates(self, names: Iterable[str]) -> None:
         """Replace fixed-preset completion candidates."""
@@ -102,10 +400,9 @@ class MarkdownEditor(QPlainTextEdit):
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
         """Handle folding, selection expansion, line editing, and completion."""
 
-        modifiers = event.modifiers()
         key = event.key()
-        control = Qt.KeyboardModifier.ControlModifier
-        alt_shift = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier
+        modifiers = event.modifiers()
+        no_modifier = modifiers == Qt.KeyboardModifier.NoModifier
 
         # QCompleter normally filters this event, but with a QPlainTextEdit it
         # can occasionally reach the editor as well.  Consume it explicitly
@@ -122,38 +419,26 @@ class MarkdownEditor(QPlainTextEdit):
                 event.accept()
                 return
 
-        if modifiers == control and key == Qt.Key.Key_W:
-            self.expand_selection()
-            return
-        if modifiers == control and key in (Qt.Key.Key_C, Qt.Key.Key_X) and not self.textCursor().hasSelection():
-            self._copy_or_cut_current_line(key == Qt.Key.Key_X)
-            return
-        if modifiers == alt_shift and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-            self.move_current_line(-1 if key == Qt.Key.Key_Up else 1)
-            return
-        if modifiers & control:
-            if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
-                if modifiers & Qt.KeyboardModifier.ShiftModifier:
-                    self.expand_all()
-                elif modifiers & Qt.KeyboardModifier.AltModifier:
-                    self.expand_section(recursive=True)
-                else:
-                    self.expand_section(recursive=False)
-                return
-            if key == Qt.Key.Key_Minus:
-                if modifiers & Qt.KeyboardModifier.ShiftModifier:
-                    self.collapse_all()
-                else:
-                    self.collapse_section()
-                return
-        if not modifiers and key in (Qt.Key.Key_QuoteDbl, Qt.Key.Key_Apostrophe):
+        if no_modifier and key in (Qt.Key.Key_QuoteDbl, Qt.Key.Key_Apostrophe):
             self.wrap_selection(event.text(), event.text())
             return
-        if not modifiers and key == Qt.Key.Key_QuoteLeft:
+        if no_modifier and key == Qt.Key.Key_QuoteLeft:
             self.wrap_selection("`", "`")
             return
         super().keyPressEvent(event)
         self._update_import_completion()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if self._search_bar.isVisible():
+            self._search_bar.reposition()
+
+    def _on_document_changed(self) -> None:
+        """Keep fold markers and live search overlays in sync with the text."""
+
+        self._update_fold_markers()
+        if self._search_bar.isVisible():
+            self._search_bar.refresh_matches()
 
     def _line_bounds(self, block=None) -> tuple[int, int]:
         """Return Python-text offsets for one document block, including its newline."""
@@ -398,6 +683,24 @@ class MarkdownEditor(QPlainTextEdit):
     def _update_fold_markers(self) -> None:
         """Shade visible headings whose body currently contains hidden blocks."""
 
+        self._update_extra_selections()
+
+    def _update_extra_selections(self) -> None:
+        """Merge fold markers and search highlights into one selection list."""
+
+        selections = self._compute_fold_selections()
+        for index, match in enumerate(self._search_matches):
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = match
+            if index == self._current_search_index:
+                selection.format.setBackground(QColor(SEARCH_CURRENT_COLOR))
+                selection.format.setForeground(QColor(SEARCH_CURRENT_TEXT_COLOR))
+            else:
+                selection.format.setBackground(QColor(SEARCH_MATCH_COLOR))
+            selections.append(selection)
+        self.setExtraSelections(selections)
+
+    def _compute_fold_selections(self) -> list[QTextEdit.ExtraSelection]:
         selections: list[QTextEdit.ExtraSelection] = []
         block = self.document().firstBlock()
         while block.isValid():
@@ -417,13 +720,16 @@ class MarkdownEditor(QPlainTextEdit):
                     selection = QTextEdit.ExtraSelection()
                     selection.cursor = QTextCursor(self.document())
                     selection.cursor.setPosition(block.position())
-                    selection.cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                    selection.cursor.movePosition(
+                        QTextCursor.MoveOperation.EndOfBlock,
+                        QTextCursor.MoveMode.KeepAnchor,
+                    )
                     selection.format.setBackground(QColor("#e3e5eb"))
                     selection.format.setForeground(QColor("#6b7280"))
                     selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
                     selections.append(selection)
             block = block.next()
-        self.setExtraSelections(selections)
+        return selections
 
     def _refresh_document_layout(self) -> None:
         self.document().markContentsDirty(0, self.document().characterCount())

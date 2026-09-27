@@ -194,6 +194,11 @@ class PromptService:
 
         return self.repository.get_settings()
 
+    def backup_database(self) -> Path:
+        """Create and return a verified backup of the active local database."""
+
+        return self.repository.backup_database()
+
     def save_settings(self, settings: Mapping[str, str]) -> None:
         """Persist UI settings."""
 
