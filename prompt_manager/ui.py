@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
+from typing import cast
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QKeyEvent, QKeySequence, QPainter, QPen, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QKeySequenceEdit, QLineEdit, QListWidget, QListWidgetItem,
@@ -28,13 +30,20 @@ QFrame#Sidebar, QFrame#EditorCard, QFrame#ToolbarCard, QFrame#FillCard, QFrame#T
 QWidget#AgentConversationCard {
     background: #ffffff; border: 1px solid #e6e8ef; border-radius: 16px;
 }
-QLabel#AppTitle { font-size: 26px; font-weight: 700; color: #151923; }
+QLabel#AppTitle { font-size: 20px; font-weight: 700; color: #151923; }
 QLabel#Subtitle, QLabel#Hint, QLabel#Meta { color: #737a8c; }
 QLineEdit, QTextEdit, QPlainTextEdit {
     background: #fbfbfd; border: 1px solid #dfe3eb; border-radius: 10px;
     padding: 8px 10px; selection-background-color: #8b7cf6;
 }
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus { border: 1px solid #8b7cf6; }
+QLineEdit#InlineTitleEdit {
+    background: #ffffff;
+    border: none;
+    border-radius: 0;
+    padding: 0px 2px;
+}
+QLineEdit#InlineTitleEdit:focus { border: none; }
 QPushButton, QToolButton {
     border: none; border-radius: 9px; padding: 8px 12px;
     background: #eef0f6; color: #353b4b; font-weight: 600;
@@ -98,6 +107,8 @@ SHORTCUT_LABELS = {
     "collapse_all": "折叠全部段落",
 }
 DEFAULT_ITEM_NAME_MAX_LENGTH = 10
+DEFAULT_NEW_PROMPT_NAME = "新建提示词"
+DEFAULT_NEW_PROMPT_CONTENT = "# 新建提示词\n"
 
 PROMPT_ID_ROLE = Qt.ItemDataRole.UserRole
 ITEM_TYPE_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -209,9 +220,16 @@ class PromptListWidget(QListWidget):
 
 
 class PromptListRow(QWidget):
-    """Compact prompt row with pinning, grouping, and quick-copy actions."""
+    """Compact prompt row with pinning, grouping, inline rename, and quick use.
 
-    quick_copy_requested = Signal(int)
+    The row owns an inline rename affordance: double-clicking the title swaps
+    the label for a text field and emits :attr:`rename_requested` once editing
+    finishes.  The copy button reuses the full "use prompt" workflow instead of
+    silently copying remembered placeholder values.
+    """
+
+    use_requested = Signal(int)
+    rename_requested = Signal(int, str)
     group_requested = Signal(int, object)
     pin_requested = Signal(int, bool)
 
@@ -220,16 +238,33 @@ class PromptListRow(QWidget):
         self.prompt_id = prompt.id
         self._full_name = prompt.name
         self._max_name_length = max_name_length
+        self._editing = False
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 5, 4)
         layout.setSpacing(2)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        title = QLabel()
-        self._title_label = title
-        title.setToolTip(prompt.name)
-        title.setMinimumWidth(0)
-        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+        self._title_label = QLabel()
+        self._title_label.setToolTip(prompt.name)
+        self._title_label.setMinimumWidth(0)
+        self._title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._title_label.installEventFilter(self)
+
+        self._title_edit = QLineEdit()
+        # A dedicated object name lets the stylesheet drop the global
+        # rounded frame and keep only a white background while editing,
+        # so the inline editor no longer overlaps the row's text.
+        self._title_edit.setObjectName("InlineTitleEdit")
+        self._title_edit.setVisible(False)
+        self._title_edit.editingFinished.connect(self._commit_rename)
+
+        self._title_stack = QStackedWidget()
+        self._title_stack.setMinimumWidth(0)
+        self._title_stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._title_stack.addWidget(self._title_label)
+        self._title_stack.addWidget(self._title_edit)
+
         pin_button = QPushButton("📌" if not prompt.is_pinned else "📍")
         pin_button.setObjectName("PinButton")
         pin_button.setFixedWidth(26)
@@ -244,13 +279,47 @@ class PromptListRow(QWidget):
         group_button.clicked.connect(lambda: self.group_requested.emit(self.prompt_id, group_button))
         copy_button = CopyButton()
         copy_button.setFixedWidth(26)
-        copy_button.setToolTip("使用上次保存的占位符值复制")
-        copy_button.clicked.connect(lambda: self.quick_copy_requested.emit(self.prompt_id))
-        layout.addWidget(title)
+        copy_button.setToolTip("使用提示词")
+        copy_button.clicked.connect(lambda: self.use_requested.emit(self.prompt_id))
+        layout.addWidget(self._title_stack, 1)
         layout.addWidget(pin_button)
         layout.addWidget(group_button)
         layout.addWidget(copy_button)
         self._update_title()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt override
+        """Enter inline rename mode when the title label is double-clicked."""
+
+        if obj is self._title_label and event.type() == QEvent.Type.MouseButtonDblClick:
+            self._begin_rename()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _begin_rename(self) -> None:
+        """Swap the title label for an editable field seeded with the old name."""
+
+        if self._editing:
+            return
+        self._editing = True
+        self._title_edit.setText(self._full_name)
+        self._title_stack.setCurrentWidget(self._title_edit)
+        self._title_edit.selectAll()
+        self._title_edit.setFocus()
+
+    def _commit_rename(self) -> None:
+        """Finish inline editing and request a rename when the name changed."""
+
+        if not self._editing:
+            return
+        self._editing = False
+        self._title_stack.setCurrentWidget(self._title_label)
+        new_name = self._title_edit.text().strip()
+        if not new_name or new_name == self._full_name:
+            return
+        self._full_name = new_name
+        self._title_label.setToolTip(new_name)
+        self._update_title()
+        self.rename_requested.emit(self.prompt_id, new_name)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         """Keep the title visibly elided as the row receives its list width."""
@@ -274,7 +343,7 @@ class CopyButton(QPushButton):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("MiniButton")
-        self.setAccessibleName("复制")
+        self.setAccessibleName("使用提示词")
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         """Paint two offset outlines so the icon is independent of system fonts."""
@@ -614,6 +683,11 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     """Main window for browsing, editing, and using stored prompts."""
 
+    # Maximum interval between the two Shift presses that open the
+    # currently selected prompt.  Chosen to match the OS double-click
+    # interval so the gesture feels like a standard double click.
+    # _DOUBLE_SHIFT_MAX_INTERVAL_MS = QApplication.doubleClickInterval() if QApplication.instance() else 400
+
     def __init__(self, service: PromptService) -> None:
         super().__init__()
         self.service = service
@@ -623,6 +697,20 @@ class MainWindow(QMainWindow):
         self.item_name_max_length = self._read_item_name_max_length(self.service.settings())
         self._loading_editor = False
         self._loading_temporary = False
+        # Double Shift gesture state.
+        #
+        # ``_last_shift_press_time`` holds the monotonic time of the most
+        # recent counted physical Shift press, or ``None`` while no press is
+        # pending.  ``_last_shift_press_id`` holds that press's event
+        # timestamp so Qt's re-delivery of the very same event along the
+        # widget parent chain can be recognised and ignored.
+        self._last_shift_press_time: float | None = None
+        self._last_shift_press_id: int | None = None
+        # Qt's double-click interval defines how quickly the second Shift
+        # press must follow the first one.  It is read here rather than at
+        # class-definition time because no QApplication instance exists while
+        # this module is being imported.
+        self._double_shift_interval_seconds = QApplication.doubleClickInterval() / 1000.0
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(650)
@@ -640,35 +728,43 @@ class MainWindow(QMainWindow):
         self._backup_thread: _DatabaseBackupThread | None = None
         self._install_shortcuts()
         self.refresh_prompt_list()
+        # Application-level filter is required because the double Shift
+        # gesture must fire regardless of which child widget owns focus.
+        application = QApplication.instance()
+        if application is not None:
+            application.installEventFilter(self)
 
     def _build_ui(self) -> None:
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(26, 22, 26, 18)
         root.setSpacing(14)
-        toolbar = QFrame()
-        toolbar.setObjectName("ToolbarCard")
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(18, 14, 18, 14)
-        title_box = QVBoxLayout()
+
+        columns = QHBoxLayout()
+        columns.setSpacing(14)
+
+        # Left column: compact title card, the prompt list card, and the
+        # settings/Agent actions moved below the list to free vertical space.
+        left_panel = QWidget()
+        left_panel.setFixedWidth(250)
+        left_column = QVBoxLayout(left_panel)
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.setSpacing(14)
+
+        title_card = QFrame()
+        title_card.setObjectName("ToolbarCard")
+        title_layout = QVBoxLayout(title_card)
+        title_layout.setContentsMargins(18, 14, 18, 14)
         app_title = QLabel("Prompt Manager")
         app_title.setObjectName("AppTitle")
-        subtitle = QLabel("把常用提示词和固定预设放在一个清晰、可靠的地方")
-        subtitle.setObjectName("Subtitle")
-        title_box.addWidget(app_title)
-        title_box.addWidget(subtitle)
-        toolbar_layout.addLayout(title_box, 1)
-        settings_button = QPushButton("设置")
-        settings_button.clicked.connect(self.open_settings)
-        use_button = QPushButton("使用提示词")
-        use_button.clicked.connect(self.use_current_prompt)
-        self.agent_button = QPushButton("Agent")
-        self.agent_button.setCheckable(True)
-        self.agent_button.clicked.connect(self.open_agent)
-        toolbar_layout.addWidget(settings_button)
-        toolbar_layout.addWidget(use_button)
-        toolbar_layout.addWidget(self.agent_button)
-        root.addWidget(toolbar)
+        title_layout.addWidget(app_title)
+        left_column.addWidget(title_card)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(8)
 
         category_bar = QHBoxLayout()
         self.prompt_category_button = QPushButton("提示词预设")
@@ -680,16 +776,8 @@ class MainWindow(QMainWindow):
         self.prompt_category_button.setChecked(True)
         self.prompt_category_button.clicked.connect(lambda: self.switch_category("prompt"))
         self.fixed_category_button.clicked.connect(lambda: self.switch_category("fixed"))
-        category_bar.addStretch()
-        root.addLayout(category_bar)
+        side_layout.addLayout(category_bar)
 
-        columns = QHBoxLayout()
-        columns.setSpacing(14)
-        sidebar = QFrame()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(250)
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(14, 14, 14, 14)
         side_header = QHBoxLayout()
         side_label = QLabel("我的条目")
         side_label.setStyleSheet("font-size: 16px; font-weight: 700;")
@@ -703,12 +791,13 @@ class MainWindow(QMainWindow):
         side_header.addWidget(self.count_label)
         side_header.addWidget(self.new_group_button)
         side_layout.addLayout(side_header)
+
         self.prompt_list = PromptListWidget()
         self.prompt_list.currentItemChanged.connect(self._select_prompt)
-        self.prompt_list.itemDoubleClicked.connect(lambda _item: self.use_current_prompt())
         self.prompt_list.prompt_dropped.connect(self._reorder_prompt_by_drag)
         self.prompt_list.prompt_dropped_on_group.connect(self._assign_prompt_by_drag)
         side_layout.addWidget(self.prompt_list, 1)
+
         self.temporary_text_button = QPushButton("临时文本")
         self.temporary_text_button.setObjectName("TemporaryButton")
         self.temporary_text_button.setCheckable(True)
@@ -718,14 +807,25 @@ class MainWindow(QMainWindow):
         new_button.setObjectName("PrimaryButton")
         new_button.setToolTip("新建当前类别的条目")
         new_button.clicked.connect(self.new_prompt)
-        # Share the bottom row equally: the temporary-text button keeps about
-        # half of its previous width while the new-entry button fits beside it.
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(8)
         bottom_row.addWidget(self.temporary_text_button, 1)
         bottom_row.addWidget(new_button, 1)
         side_layout.addLayout(bottom_row)
-        columns.addWidget(sidebar)
+        left_column.addWidget(sidebar, 1)
+
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
+        settings_button = QPushButton("设置")
+        settings_button.clicked.connect(self.open_settings)
+        self.agent_button = QPushButton("Agent")
+        self.agent_button.setCheckable(True)
+        self.agent_button.clicked.connect(self.open_agent)
+        actions_row.addWidget(settings_button, 1)
+        actions_row.addWidget(self.agent_button, 1)
+        left_column.addLayout(actions_row)
+
+        columns.addWidget(left_panel)
 
         editor = QFrame()
         editor.setObjectName("EditorCard")
@@ -740,13 +840,6 @@ class MainWindow(QMainWindow):
         self.meta_label.setObjectName("Meta")
         header.addWidget(self.meta_label)
         editor_layout.addLayout(header)
-
-        form = QFormLayout()
-        form.setVerticalSpacing(10)
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("例如：产品需求分析")
-        form.addRow("名称", self.name_edit)
-        editor_layout.addLayout(form)
 
         self.editing_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.editing_splitter.setChildrenCollapsible(False)
@@ -805,13 +898,13 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.autosave_label)
         editor_layout.addLayout(actions)
         columns.addWidget(editor, 1)
+
         self.agent_panel = AgentPanel(self)
         columns.addWidget(self.agent_panel)
         self.agent_panel.setVisible(False)
         root.addLayout(columns, 1)
         self.setCentralWidget(central)
 
-        self.name_edit.textChanged.connect(self._schedule_autosave)
         self.content_edit.textChanged.connect(self._on_content_changed)
         self.temporary_text_edit.textChanged.connect(self._schedule_temporary_autosave)
         self.statusBar().showMessage("准备就绪")
@@ -996,7 +1089,7 @@ class MainWindow(QMainWindow):
                         return
             self.prompt_list.setCurrentRow(0)
         elif not prompts:
-            self.new_prompt()
+            self._clear_editor()
 
     def _add_group_item(self, group_id: int, name: str, count: int) -> None:
         item = QListWidgetItem()
@@ -1030,7 +1123,8 @@ class MainWindow(QMainWindow):
         item.setData(ITEM_TYPE_ROLE, ITEM_PROMPT)
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled)
         row = PromptListRow(prompt, self.item_name_max_length)
-        row.quick_copy_requested.connect(self.quick_copy)
+        row.use_requested.connect(self.use_prompt)
+        row.rename_requested.connect(self._rename_prompt_from_list)
         row.group_requested.connect(self._show_group_menu)
         row.pin_requested.connect(self._set_prompt_pinned)
         item.setSizeHint(row.sizeHint())
@@ -1223,11 +1317,23 @@ class MainWindow(QMainWindow):
     def _load_prompt_into_editor(self, prompt: Prompt) -> None:
         self._loading_editor = True
         self.current_prompt_id = prompt.id
-        self.name_edit.setText(prompt.name)
         self.content_edit.setPlainText(prompt.content)
-        self.content_edit.set_import_candidates(item.name for item in self.service.list_prompts("fixed") if item.id != prompt.id)
+        self.content_edit.set_import_candidates(
+            item.name for item in self.service.list_prompts("fixed") if item.id != prompt.id
+        )
         self._update_meta(prompt)
         self.delete_button.setEnabled(True)
+        self._loading_editor = False
+
+    def _clear_editor(self) -> None:
+        """Reset the editor when the active category has no prompts left."""
+
+        self._loading_editor = True
+        self.current_prompt_id = None
+        self.prompt_list.clearSelection()
+        self.content_edit.clear()
+        self.meta_label.setText("")
+        self.delete_button.setEnabled(False)
         self._loading_editor = False
 
     def _update_meta(self, prompt: Prompt) -> None:
@@ -1238,19 +1344,54 @@ class MainWindow(QMainWindow):
             placeholders = imports = 0
         self.meta_label.setText(f"{placeholders} 个输入 · {imports} 个导入")
 
+    def _unique_new_prompt_name(self) -> str:
+        """Return a free ``新建提示词`` name for the active category."""
+
+        candidate = DEFAULT_NEW_PROMPT_NAME
+        index = 2
+        while self.service.find_prompt_by_name(candidate, self.current_kind) is not None:
+            candidate = f"{DEFAULT_NEW_PROMPT_NAME} {index}"
+            index += 1
+        return candidate
+
     def new_prompt(self) -> None:
+        """Create a fresh prompt entry and place the caret in the content editor."""
+
         self._autosave_timer.stop()
-        self._loading_editor = True
-        self.current_prompt_id = None
-        self.prompt_list.clearSelection()
-        self.name_edit.clear()
-        self.content_edit.clear()
-        self.content_edit.set_import_candidates(item.name for item in self.service.list_prompts("fixed"))
-        self.meta_label.setText("新建")
-        self.delete_button.setEnabled(False)
-        self._loading_editor = False
-        self.name_edit.setFocus()
-        self.statusBar().showMessage("正在新建提示词，输入完成后会自动保存")
+        try:
+            name = self._unique_new_prompt_name()
+            prompt = self.service.create_prompt(name, DEFAULT_NEW_PROMPT_CONTENT, self.current_kind)
+        except (ValidationError, StorageError) as exc:
+            self._show_error(str(exc))
+            return
+        self.refresh_prompt_list(select_id=prompt.id)
+        self.content_edit.setFocus()
+        self.content_edit.selectAll()
+        cursor = self.content_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.content_edit.setTextCursor(cursor)
+        self.statusBar().showMessage("已新建条目，可直接编辑内容", 2500)
+
+    def _rename_prompt_from_list(self, prompt_id: int, new_name: str) -> None:
+        """Persist an inline title rename requested from a list row."""
+
+        new_name = new_name.strip()
+        prompt = self.service.get_prompt(prompt_id)
+        if prompt is None or not new_name or new_name == prompt.name:
+            return
+        content = prompt.content
+        if prompt_id == self.current_prompt_id:
+            editor_content = self.content_edit.toPlainText()
+            if editor_content.strip():
+                content = editor_content
+        try:
+            self.service.update_prompt(prompt_id, new_name, content, prompt.kind)
+        except (ValidationError, StorageError) as exc:
+            self.statusBar().showMessage(str(exc), 3500)
+            self.refresh_prompt_list(select_id=self.current_prompt_id, load_selection=False)
+            return
+        self.refresh_prompt_list(select_id=prompt_id, load_selection=False)
+        self.statusBar().showMessage("条目已重命名", 2200)
 
     def _on_content_changed(self) -> None:
         if not self._loading_editor:
@@ -1262,23 +1403,22 @@ class MainWindow(QMainWindow):
             self._autosave_timer.start()
 
     def _auto_save(self) -> None:
-        name = self.name_edit.text()
+        """Persist the editor content while keeping the entry name unchanged."""
+
+        if self.current_prompt_id is None:
+            return
         content = self.content_edit.toPlainText()
-        if not name.strip() or not content.strip():
-            self.autosave_label.setText("自动保存已开启（名称和内容不能为空）")
+        if not content.strip():
+            self.autosave_label.setText("自动保存已开启（内容不能为空）")
             return
         try:
-            if self.current_prompt_id is None:
-                prompt = self.service.create_prompt(name, content, self.current_kind)
-                self.current_prompt_id = prompt.id
-                self.delete_button.setEnabled(True)
-                self.refresh_prompt_list(prompt.id)
-                self.statusBar().showMessage("已自动创建", 2200)
-            else:
-                prompt = self.service.update_prompt(self.current_prompt_id, name, content, self.current_kind)
-                self._update_meta(prompt)
-                self.statusBar().showMessage("已自动保存", 1800)
+            prompt = self.service.get_prompt(self.current_prompt_id)
+            if prompt is None:
+                return
+            updated = self.service.update_prompt(self.current_prompt_id, prompt.name, content, prompt.kind)
+            self._update_meta(updated)
             self.autosave_label.setText("已自动保存")
+            self.statusBar().showMessage("已自动保存", 1800)
         except (ValidationError, StorageError) as exc:
             self.autosave_label.setText("自动保存失败")
             self.statusBar().showMessage(str(exc), 3500)
@@ -1522,15 +1662,20 @@ class MainWindow(QMainWindow):
         self.refresh_prompt_list()
         self.statusBar().showMessage("已删除", 3000)
 
-    def use_current_prompt(self) -> None:
-        if self.current_prompt_id is None:
-            self._show_error("请先选择或输入一个提示词")
-            return
-        self._autosave_timer.stop()
-        self._auto_save()
-        prompt = self.service.get_prompt(self.current_prompt_id)
+    def use_prompt(self, prompt_id: int) -> None:
+        """Render and copy one prompt, asking for placeholder values when needed.
+
+        The list-row copy button delegates here so every entry exposes the full
+        "use prompt" workflow rather than a silent remembered-value copy.
+        """
+
+        if prompt_id == self.current_prompt_id:
+            # Flush pending edits so the copy reflects exactly what is on screen.
+            self._autosave_timer.stop()
+            self._auto_save()
+        prompt = self.service.get_prompt(prompt_id)
         if prompt is None:
-            self._show_error("提示词已不存在，请刷新后重试")
+            self._show_error("提示词已不存在")
             return
         try:
             if not self.service.placeholders_for(prompt):
@@ -1541,17 +1686,6 @@ class MainWindow(QMainWindow):
         except (ValidationError, StorageError) as exc:
             self._show_error(str(exc))
 
-    def quick_copy(self, prompt_id: int) -> None:
-        prompt = self.service.get_prompt(prompt_id)
-        if prompt is None:
-            self._show_error("提示词已不存在")
-            return
-        try:
-            values = self.service.remembered_values(prompt.id)
-            self._copy_to_clipboard(self.service.render(prompt, values), "已使用上次输入复制")
-        except (ValidationError, StorageError) as exc:
-            self._show_error(str(exc))
-
     def _copy_to_clipboard(self, text: str, message: str) -> None:
         QApplication.clipboard().setText(text)
         self.statusBar().showMessage(message, 3500)
@@ -1559,9 +1693,67 @@ class MainWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "无法完成操作", message)
 
+    def eventFilter(self, obj: object, event: QEvent) -> bool:  # noqa: N802 - Qt override
+        """Open the fill dialog when Shift is pressed twice in quick succession.
+
+        The filter is installed on :class:`QApplication` so the gesture fires
+        no matter which child widget owns the keyboard focus, as long as the
+        event belongs to this main window.  Events aimed at modal dialogs,
+        popup menus, or other top-level windows are ignored, and a prompt must
+        be selected in the navigation list for the gesture to do anything.
+
+        Qt re-delivers an unaccepted key event to every ancestor widget, so a
+        single physical Shift press reaches this filter several times.  Every
+        re-delivery carries the same :meth:`QKeyEvent.timestamp`, which is used
+        here to collapse them into one logical press.  Counting each
+        re-delivery separately made one tap satisfy the double-press condition
+        and queued one fill dialog per propagation step.
+
+        :param obj: Object the event is being delivered to.
+        :param event: Event being delivered.
+        :return: Always ``False``; the event is never consumed so normal Shift
+            behaviour in the focused widget is preserved.
+        """
+
+        if (
+                event.type() == QEvent.Type.KeyPress
+                and isinstance(obj, QWidget)
+                and obj.window() is self
+        ):
+            key_event = cast(QKeyEvent, event)
+            if key_event.key() == Qt.Key.Key_Shift and not key_event.isAutoRepeat():
+                press_id = key_event.timestamp()
+                if press_id != self._last_shift_press_id:
+                    self._last_shift_press_id = press_id
+                    now = time.monotonic()
+                    if (
+                            self._last_shift_press_time is not None
+                            and now - self._last_shift_press_time <= self._double_shift_interval_seconds
+                    ):
+                        # Reset the pending state before invoking the action so
+                        # the modal fill dialog cannot observe a stale press.
+                        self._last_shift_press_time = None
+                        self._use_current_prompt_shortcut()
+                    else:
+                        self._last_shift_press_time = now
+            elif key_event.key() != Qt.Key.Key_Shift:
+                self._last_shift_press_time = None
+                self._last_shift_press_id = None
+        return super().eventFilter(obj, event)
+
+    def _use_current_prompt_shortcut(self) -> None:
+        """Copy the prompt currently selected in the navigation list."""
+
+        if self.current_prompt_id is None:
+            return
+        self.use_prompt(self.current_prompt_id)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
         """Flush debounced edits before the repository is closed by the app."""
 
+        application = QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
         if self._backup_thread is not None and self._backup_thread.isRunning():
             self._backup_thread.wait()
         self._autosave_timer.stop()
