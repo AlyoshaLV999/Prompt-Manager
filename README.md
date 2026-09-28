@@ -1,797 +1,409 @@
 # Prompt Manager
 
-**简体中文** | [English](#english)
+[简体中文](#简体中文) | [English](#english)
 
-Prompt Manager 是一个本地运行的桌面提示词管理工具，用于集中编写、组织和复用 Markdown 提示词与固定预设。
+---
 
-本项目支持运行时替换占位符和可复用固定预设。你可以将经常变化的内容定义为 `REPLACE` 占位符，将通用规则、格式要求或其他固定内容保存为独立预设，并通过 `IMPORT` 引用。使用提示词时，Prompt Manager 会完成固定预设展开、变量替换，并将最终内容直接复制到剪贴板。
+## 简体中文
 
-所有提示词、分组、占位符历史输入和应用设置均保存在本地 SQLite 数据库中。本项目不依赖网络服务、Web API 或外部数据库。
+Prompt Manager 是一个本地运行的 Markdown 提示词管理器，提供桌面图形界面。它把常用的提示词、可复用的固定预设、分组与占位符输入集中在一个窗口里，让你可以直接编辑、复用、复制和整理自己的提示词库。所有数据保存在本机的 SQLite 数据库中，不依赖任何外部服务。
 
-## 核心特性
+### 核心特性
 
-* **本地提示词管理**：创建、编辑、删除和分类管理提示词，内容自动保存。
-* **提示词与固定预设分离**：分别管理普通提示词和可被其他提示词引用的固定预设。
-* **动态输入占位符**：使用 `=====REPLACE: 名称=====` 定义运行时输入。
-* **固定预设复用**：使用 `=====IMPORT: 预设名称=====` 将固定预设嵌入其他提示词。
-* **递归预设展开**：固定预设可以继续引用其他固定预设，并提供循环导入保护。
-* **输入记忆**：自动保存每个提示词上次填写的占位符值，便于重复使用。
-* **快速复制**：可以直接使用上次保存的输入渲染并复制提示词。
-* **分组、置顶与拖拽排序**：创建一级分组，将提示词移入分组，置顶常用条目，并在同一分组或同一置顶区域内拖拽排序。
-* **Markdown 编辑器**：提供标题、粗体、斜体、代码、引用、列表、链接和代码块等常用编辑操作。
-* **Markdown 语法高亮**：对标题、占位符、行内代码和强调内容进行轻量高亮。
-* **章节折叠**：基于 Markdown 标题层级折叠或展开内容。
-* **编辑器快捷操作**：支持扩展选区、整行复制/剪切、移动行等编辑操作。
-* **导入自动补全**：输入 `IMPORT` 标记时，可从已有固定预设中进行名称补全，并支持中文名称拼音首字母匹配。
-* **临时文本区**：提供独立的持久化临时记录面板。
-* **可配置快捷键**：占位符插入和设置等操作的快捷键可以在应用内修改。
-* **本地 SQLite 存储**：提示词、分组、输入历史和应用设置统一持久化到本地数据库。
-* **旧数据库迁移**：首次启动时可自动发现旧位置数据库，也可以通过命令行参数或环境变量指定旧数据库路径。
+- **两类条目**：`提示词预设` 用于完整提示词，`固定预设` 用于可被其他提示词复用的片段。
+- **分组与置顶**：为每个类别建立一级分组，支持分组折叠、重命名、删除，条目可置顶并拖拽排序。
+- **内联重命名**：双击导航栏中的条目标题即可直接改名。
+- **Markdown 编辑器**：标题高亮、按标题层级折叠段落、查找/替换、整行复制与剪切、整行上下移动、选区逐级扩展、引号/括号/反引号包裹。
+- **占位符输入**：在提示词中使用 `=====REPLACE: 标题=====` 声明输入项，使用提示词时弹窗填写，输入值会被记忆以便下次复用。
+- **固定预设导入**：使用 `=====IMPORT: 名称=====` 引用固定预设，渲染时递归展开，并检测循环导入。
+- **导入自动补全**：在编辑器中输入导入标记时，可按名称或中文拼音首字母补全固定预设。
+- **临时文本面板**：一个持久保存的临时记录区，输入后自动写入本地数据库。
+- **内置 Agent 面板**：通过 OpenAI 兼容接口与模型对话，模型可调用受限工具直接读取和管理本机的提示词与分组。
+- **附件引用**：Agent 面板支持拖拽或选择本地文本文件，作为对话上下文发送。
+- **数据库备份**：一键创建经过完整性校验的 SQLite 快照，保存到按日期命名的子目录。
+- **可自定义快捷键**：所有编辑器与全局快捷键都可以在设置中查看和修改。
 
-## 技术栈
+### 技术栈
 
-| 组件                 | 用途              |
-| ------------------ | --------------- |
-| Python 3.10+       | 应用运行环境          |
-| PySide6 6.6+ / < 7 | Qt 桌面图形界面       |
-| SQLite             | 本地数据持久化         |
-| setuptools         | Python 包构建      |
-| PyInstaller        | 可选的单文件桌面可执行程序构建 |
+| 项目 | 说明 |
+| --- | --- |
+| 语言 | Python 3.10+ |
+| GUI | PySide6（Qt for Python）6.6 ~ 6.x |
+| 存储 | SQLite（标准库 `sqlite3`，WAL 模式） |
+| 打包 | setuptools + PyInstaller |
+| 网络 | 标准库 `urllib`（Agent 的 OpenAI 兼容请求） |
 
-SQLite 通过 Python 标准库 `sqlite3` 使用，无需单独安装数据库服务。
+### 快速开始
 
-## 项目架构
+#### 环境要求
 
-应用采用简单的分层结构：
+- Python 3.10 或更高版本
+- 支持 PySide6 的桌面环境（Windows / macOS / Linux）
 
-```text
-PySide6 UI / Markdown Editor
-            │
-            ▼
-       PromptService
-      ┌─────┴─────┐
-      ▼           ▼
-Placeholder    PromptRepository
- Rendering          │
-                    ▼
-                  SQLite
-```
-
-`PromptService` 负责连接 UI 与数据层，并集中处理输入验证、占位符解析、固定预设递归展开和最终提示词渲染。
-
-## 项目结构
-
-```text
-.
-├── build.py                 # PyInstaller 可执行程序构建脚本
-├── launcher.py              # PyInstaller 启动入口
-├── pyproject.toml           # 项目元数据、依赖和命令行入口
-├── README.md
-└── prompt_manager/
-    ├── __init__.py          # 包信息与版本
-    ├── __main__.py          # python -m prompt_manager 入口
-    ├── app.py               # 应用初始化与命令行参数
-    ├── editor.py            # Markdown 编辑器、语法高亮、折叠与补全
-    ├── models.py            # Prompt 领域模型
-    ├── placeholders.py      # REPLACE / IMPORT 标记解析与替换
-    ├── service.py           # 业务逻辑、验证与提示词渲染
-    ├── storage.py           # SQLite 数据访问与持久化
-    └── ui.py                # PySide6 主界面与交互逻辑
-```
-
-## 快速开始
-
-### 环境要求
-
-* Python 3.10 或更高版本
-* 支持 PySide6 的桌面操作系统
-
-### 安装
+#### 安装与运行
 
 ```bash
 # 1. 克隆仓库
 git clone <repository-url>
+cd prompt-manager
 
-# 2. 进入项目目录
-cd <project-directory>
-
-# 3. 创建虚拟环境
+# 2. 创建并激活虚拟环境（可选但推荐）
 python -m venv .venv
-
-# 4. 激活虚拟环境
 # Windows
 .venv\Scripts\activate
-
 # macOS / Linux
 source .venv/bin/activate
 
-# 5. 安装项目
+# 3. 安装依赖
 python -m pip install -e .
+
+# 4. 启动应用
+python -m prompt_manager
 ```
 
-`pyproject.toml` 会安装运行所需的 PySide6 依赖。
-
-### 启动
-
-安装完成后，可以直接使用项目提供的命令：
+安装为包后也可以直接使用命令行入口：
 
 ```bash
 prompt-manager
 ```
 
-也可以通过 Python 模块启动：
+### 构建单文件可执行程序
+
+项目提供 `build.py`，使用 PyInstaller 生成单文件窗口程序，产物位于 `dist/`：
 
 ```bash
-python -m prompt_manager
+python -m pip install pyinstaller
+python build.py
 ```
 
-## 配置
+用户数据不会被打包进可执行文件，升级时仍会继续使用系统数据目录中的 `prompts.sqlite3`。
+
+### 命令行参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--data-dir PATH` | 覆盖用于保存 SQLite 数据库的持久化目录 |
+| `--migrate-from PATH` | 首次启动时从指定的旧版数据库导入数据 |
 
 ### 数据目录
 
-Prompt Manager 默认使用平台数据目录保存数据库，数据库文件名为：
+数据库文件名固定为 `prompts.sqlite3`，默认位置由平台决定：
 
-```text
-prompts.sqlite3
-```
+| 平台 | 路径 |
+| --- | --- |
+| Windows | `%APPDATA%\PromptManager\prompts.sqlite3` |
+| macOS | `~/Library/Application Support/PromptManager/prompts.sqlite3` |
+| Linux | `$XDG_DATA_HOME/prompt-manager/prompts.sqlite3`（默认 `~/.local/share/prompt-manager/prompts.sqlite3`） |
 
-默认数据目录根据操作系统确定：
+首次启动时，如果新数据库尚不存在，程序会在可执行文件目录、当前工作目录、包目录等位置查找旧版本遗留的数据库并自动迁移；原文件不会被修改。
 
-| 系统           | 默认目录                                                                   |
-| ------------ | ---------------------------------------------------------------------- |
-| Windows      | `%APPDATA%\PromptManager`                                              |
-| macOS        | `~/Library/Application Support/PromptManager`                          |
-| Linux / Unix | `$XDG_DATA_HOME/prompt-manager`，未设置时使用 `~/.local/share/prompt-manager` |
+### 配置与环境变量
 
-可以通过环境变量覆盖默认数据目录：
+| 环境变量 | 用途 | 是否必填 |
+| --- | --- | --- |
+| `PROMPT_MANAGER_DATA_DIR` | 覆盖默认数据目录 | 否 |
+| `PROMPT_MANAGER_LEGACY_DATABASE` | 指定待迁移的旧数据库路径 | 否 |
+| `OPENAI_API_KEY` | 服务商为 OpenAI 且未在设置中填写 Key 时使用 | 否 |
+| `GEMINI_API_KEY` | 服务商为 Gemini 且未在设置中填写 Key 时使用 | 否 |
 
-```bash
-PROMPT_MANAGER_DATA_DIR=/path/to/data prompt-manager
-```
+Agent 的 API Key 只在本次运行内保留，不会写入本地数据库。Ollama 作为本地服务不需要 Key。
 
-也可以在启动时使用 `--data-dir`：
+### 使用方法
 
-```bash
-prompt-manager --data-dir /path/to/data
-```
+#### 占位符与固定预设
 
-或者：
-
-```bash
-python -m prompt_manager --data-dir /path/to/data
-```
-
-命令行参数指定的目录优先于默认平台数据目录。
-
-### 旧数据库迁移
-
-首次启动且目标数据库尚不存在时，Prompt Manager 可以迁移旧版本数据库。可以使用 `--migrate-from` 显式指定旧数据库路径：
-
-```bash
-prompt-manager --migrate-from /path/to/legacy/prompts.sqlite3
-```
-
-也可以通过环境变量提供旧数据库路径：
-
-```bash
-PROMPT_MANAGER_LEGACY_DATABASE=/path/to/legacy/prompts.sqlite3 prompt-manager
-```
-
-应用还会检查可执行文件目录、当前工作目录、包根目录以及 PyInstaller 解压目录中的常见旧数据库文件名。
-
-### 应用设置
-
-设置窗口中可以修改应用快捷键和导航栏名称显示长度。设置会持久化保存到本地数据库。
-
-临时文本区的内容也会自动保存，并在后续启动应用时恢复。
-
-## 使用方法
-
-### 1. 创建提示词
-
-启动应用后，在 **提示词预设** 分类中点击“新建”，填写名称和 Markdown 内容。
-
-修改内容后会自动保存，无需手动执行保存操作。
-
-例如：
+在提示词内容中使用两种标记：
 
 ```markdown
 # 代码审查
 
-请审查下面的代码：
+=====REPLACE: 编程语言=====
 
-=====REPLACE: 代码=====
-
-重点关注：
-
-=====REPLACE: 审查重点=====
-```
-
-点击“使用提示词”时，应用会根据占位符生成输入框。填写内容并确认后，最终提示词会复制到系统剪贴板。
-
-同一个提示词之前填写的值会被保存，并在下次使用时自动恢复。
-
-### 2. 使用替换占位符
-
-替换占位符格式为：
-
-```text
-=====REPLACE: 占位符名称=====
-```
-
-例如：
-
-```markdown
-请为以下主题生成技术方案：
-
-=====REPLACE: 主题=====
-
-目标用户：
-
-=====REPLACE: 目标用户=====
-```
-
-同名占位符只需要填写一次，其值会替换该提示词中的所有对应标记。
-
-### 3. 创建固定预设
-
-固定预设用于保存需要在多个提示词中复用的内容，例如代码规范、输出格式或通用约束。
-
-在 **固定预设** 分类中新建一个名为 `代码质量要求` 的预设：
-
-```markdown
-请确保：
-
-- 代码结构清晰
-- 命名具有可读性
-- 避免不必要的重复
-- 对关键设计决策进行说明
-```
-
-然后在普通提示词中引用：
-
-```markdown
-请实现以下需求：
-
-=====REPLACE: 需求=====
-
-## 代码质量
+请审查以下 ====REPLACE: 编程语言===== 代码。
 
 =====IMPORT: 代码质量要求=====
 ```
 
-使用提示词时，`IMPORT` 标记会自动展开为对应固定预设的完整内容。
+- `=====REPLACE: 标题=====`：使用提示词时弹出填写窗口，输入内容按标题替换标记，并记忆到下一次。
+- `=====IMPORT: 名称=====`：渲染时按名称查找 `固定预设` 类别中的条目并递归展开；检测到循环导入时会输出 `[循环导入: 名称]` 提示。
 
-如果指定的固定预设不存在，原始 `IMPORT` 标记会保留在最终文本中。
+编辑器工具栏和“杂项”菜单可以插入这两种标记，输入导入标记时还会触发固定预设名称补全。
 
-### 4. 组合固定预设
+#### 使用提示词
 
-固定预设支持递归引用，因此可以将多个小型规则组合成更大的模板。
+- 点击导航栏条目右侧的复制按钮，或在列表中双击 Shift，即可打开使用窗口。
+- 没有占位符的提示词会直接渲染并复制到剪贴板；有占位符时会先弹出填写窗口。
+- “优化提示词”菜单会先渲染当前提示词，再拼接优化指令复制到剪贴板，可区分“无文件优化”和“有文件优化”。
 
-例如：
+#### Agent 面板
 
-```markdown
-=====IMPORT: Python 编码规范=====
+点击左下角的 `Agent` 按钮打开对话面板，在“设置 → Agent 设置”中配置服务商：
 
-=====IMPORT: 输出格式=====
-```
+| 服务商 | 默认 API 地址 | 默认模型 |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| Ollama | `http://localhost:11434/v1` | `qwen2.5:7b` |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.0-flash` |
 
-应用会递归解析引用。
+选择 Ollama 时，展开模型下拉框会通过本机 `/api/tags` 获取已安装的模型列表。Agent 可以调用的工具包括：
 
-当固定预设之间形成循环引用时，Prompt Manager 会停止继续展开，并在对应位置输出循环导入提示，避免无限递归。
+- 列出、读取、新建、修改、删除、选中提示词
+- 列出、新建分组
+- 将提示词加入分组、移出分组
 
-### 5. 分组、置顶和排序
+删除操作只有在对话中明确要求时才会被执行。Agent 面板还支持拖拽或选择本地文本文件作为附件，单个文件上限 1 MiB，附件总量上限 4 MiB。
 
-你可以在侧边栏中创建一级分组，并通过条目右侧的分组按钮将提示词移入指定分组。
+#### 默认快捷键
 
-常用提示词可以置顶。置顶条目会显示在列表的置顶区域中。
+| 功能 | 默认快捷键 |
+| --- | --- |
+| 插入替换占位符 | `Ctrl+Alt+R` |
+| 插入导入占位符 | `Ctrl+Alt+I` |
+| 打开设置 | `Ctrl+,` |
+| 查找 | `Ctrl+F` |
+| 查找和替换 | `Ctrl+R` |
+| 扩展选区 | `Ctrl+W` |
+| 复制整行（无选区时） | `Ctrl+C` |
+| 剪切整行（无选区时） | `Ctrl+X` |
+| 上移当前行 | `Alt+Shift+Up` |
+| 下移当前行 | `Alt+Shift+Down` |
+| 折叠当前段落 | `Ctrl+-` |
+| 展开当前段落 | `Ctrl++` |
+| 递归展开当前段落 | `Ctrl+Alt++` |
+| 展开全部段落 | `Ctrl+Shift++` |
+| 折叠全部段落 | `Ctrl+Shift+-` |
 
-在同一分组或同一置顶区域内，你可以拖拽提示词调整顺序。将置顶条目拖入分组时，该条目会移入分组并取消置顶。
+编辑器快捷键仅在内容编辑区获得焦点时生效，所有快捷键都可以在设置中重新绑定。
 
-删除分组后，分组中的提示词会保留，并移动到未分组区域。
+#### 数据备份
 
-### 6. 快速复制
+Agent 面板顶部的“备份数据库”按钮会在后台创建快照，保存到数据目录下以日期命名的子目录中，例如 `25-01-01/prompts.sqlite3`。同一天的重复备份会原子替换当天已有的快照。
 
-提示词列表中的“复制”按钮会直接使用该提示词之前保存的占位符值完成渲染并复制到剪贴板。
-
-对于不包含 `REPLACE` 占位符的提示词，使用时会直接渲染并复制，无需额外填写内容。
-
-### 7. 临时文本
-
-侧边栏中的“临时文本”可以打开一个独立编辑区域，用于暂存上下文、草稿或其他辅助文本。
-
-临时文本会自动保存到本地，并在后续启动应用时恢复。
-
-## Markdown 编辑器
-
-内置编辑器提供常用 Markdown 操作，包括：
-
-| 操作           | 功能                   |
-| ------------ | -------------------- |
-| H1 / H2 / H3 | 插入 Markdown 标题       |
-| 粗体           | 使用 `**` 包裹文本         |
-| 斜体           | 使用 `*` 包裹文本          |
-| 代码           | 使用反引号包裹文本            |
-| 引用           | 插入 `> `              |
-| 列表           | 插入 `- `              |
-| 链接           | 插入 Markdown 链接       |
-| 代码块          | 插入 fenced code block |
-| 替换占位符        | 插入 `REPLACE` 标记      |
-| 导入占位符        | 插入 `IMPORT` 标记       |
-
-编辑器还会对 Markdown 标题、占位符、行内代码和强调文本进行轻量语法高亮。
-
-### 编辑快捷键
-
-以下是编辑器内置操作：
-
-| 快捷键            | 操作               |
-| -------------- | ---------------- |
-| `Ctrl+W`       | 逐级扩展当前选区         |
-| `Ctrl+C`       | 无选区时复制当前整行       |
-| `Ctrl+X`       | 无选区时剪切当前整行       |
-| `Alt+Shift+↑`  | 当前行上移            |
-| `Alt+Shift+↓`  | 当前行下移            |
-| `Ctrl+-`       | 折叠当前 Markdown 章节 |
-| `Ctrl++`       | 展开当前章节           |
-| `Ctrl+Alt++`   | 递归展开当前章节         |
-| `Ctrl+Shift++` | 展开全部章节           |
-| `Ctrl+Shift+-` | 折叠全部章节           |
-
-应用操作默认快捷键：
-
-| 快捷键          | 操作               |
-| ------------ | ---------------- |
-| `Ctrl+Alt+R` | 插入 `REPLACE` 占位符 |
-| `Ctrl+Alt+I` | 插入 `IMPORT` 占位符  |
-| `Ctrl+,`     | 打开设置             |
-
-应用操作快捷键可以在设置窗口中修改，并会持久化保存。
-
-## 数据存储
-
-Prompt Manager 使用 SQLite 保存数据，数据库文件名为：
+### 项目结构
 
 ```text
-prompts.sqlite3
+prompt-manager/
+├── prompt_manager/
+│   ├── __init__.py           # 包版本
+│   ├── __main__.py           # python -m prompt_manager 入口
+│   ├── app.py                # 应用入口、命令行参数、数据库初始化
+│   ├── ui.py                 # 主窗口、导航列表、分组管理、设置对话框、Agent 工具执行
+│   ├── editor.py             # Markdown 编辑器：高亮、折叠、查找替换、导入补全
+│   ├── agent.py              # OpenAI 兼容请求与受限工具定义
+│   ├── agent_panel.py        # 内嵌 Agent 对话面板与附件处理
+│   ├── service.py            # 业务用例：校验、渲染、分组、备份
+│   ├── storage.py            # SQLite 仓储、结构迁移、旧库导入
+│   ├── models.py             # Prompt / PromptGroup 数据模型
+│   └── placeholders.py       # 占位符与导入标记的解析与渲染
+├── launcher.py               # PyInstaller 打包入口
+├── build.py                  # 单文件可执行程序构建脚本
+└── pyproject.toml            # 项目元数据与依赖声明
 ```
 
-数据库包含：
+### License
 
-* 提示词与固定预设
-* 一级分组
-* 每个提示词已记忆的占位符输入
-* 应用设置和临时文本
-
-SQLite 使用 WAL 日志模式，并启用外键约束。
-
-## 构建桌面可执行程序
-
-项目包含 `build.py` 和独立的 `launcher.py`，可通过 PyInstaller 构建单文件、无控制台窗口的桌面程序。
-
-构建前需要安装 PyInstaller：
-
-```bash
-python -m pip install PyInstaller
-```
-
-然后在项目根目录运行：
-
-```bash
-python build.py
-```
-
-构建脚本使用 PyInstaller 的单文件 GUI 模式，并将应用命名为 `PromptManager`。
-
-成功后产物位于：
-
-```text
-dist/
-```
-
-用户数据库不会打包进可执行文件。升级程序时，应用会继续使用系统数据目录中的 `prompts.sqlite3`。
-
-## License
-
-This project is licensed under the MIT License.
+本项目基于 MIT License 发布。
 
 ---
 
-<a id="english"></a>
+## English
 
-# Prompt Manager
+[简体中文](#简体中文) | [English](#english)
 
-[简体中文](#prompt-manager) · **English**
+Prompt Manager is a local Markdown prompt manager with a desktop GUI. It keeps your prompts, reusable fixed presets, groups, and placeholder inputs in one window so you can edit, reuse, copy, and organize your own prompt library. Everything is stored in a local SQLite database and no external service is required.
 
-Prompt Manager is a local desktop application for writing, organizing, and reusing Markdown prompts and fixed presets.
+### Features
 
-The project supports runtime replacement placeholders and reusable fixed presets. Frequently changing content can be represented with `REPLACE` markers, while shared rules, formatting requirements, or other reusable content can be stored as fixed presets and referenced through `IMPORT` markers. When a prompt is used, Prompt Manager expands its fixed presets, substitutes input values, and copies the rendered result directly to the clipboard.
+- **Two item kinds**: `prompt` for complete prompts, `fixed` for reusable fragments referenced by other prompts.
+- **Groups and pinning**: create first-level groups per kind, collapse, rename, or delete them, pin items, and reorder by drag and drop.
+- **Inline renaming**: double-click a title in the navigation list to rename it in place.
+- **Markdown editor**: heading highlighting, section folding by heading level, find and replace, whole-line copy and cut, line moving, selection expansion, and quote/bracket/backtick wrapping.
+- **Placeholder inputs**: declare inputs with `=====REPLACE: title=====`; values are collected in a dialog and remembered for next time.
+- **Fixed preset imports**: reference a fixed preset with `=====IMPORT: name=====`; imports are expanded recursively with cycle detection.
+- **Import completion**: typing an import marker completes fixed preset names by name or by Chinese pinyin initials.
+- **Temporary text panel**: a persistent scratch area that autosaves into the local database.
+- **Built-in Agent panel**: chat with an OpenAI-compatible model that can call a bounded tool set to read and manage local prompts and groups.
+- **File attachments**: drag or pick local text files in the Agent panel to send them as conversation context.
+- **Database backup**: create an integrity-checked SQLite snapshot in a date-named subdirectory.
+- **Configurable shortcuts**: every global and editor shortcut can be viewed and rebound in settings.
 
-Prompts, groups, remembered placeholder values, and application settings are stored locally in SQLite. The application does not depend on network services, Web APIs, or external databases.
+### Tech Stack
 
-## Features
+| Item | Description |
+| --- | --- |
+| Language | Python 3.10+ |
+| GUI | PySide6 (Qt for Python) 6.6 – 6.x |
+| Storage | SQLite (standard library `sqlite3`, WAL mode) |
+| Packaging | setuptools + PyInstaller |
+| Networking | Standard library `urllib` for OpenAI-compatible Agent requests |
 
-* **Local prompt management** — Create, edit, delete, and organize prompts with automatic saving.
-* **Prompt and fixed-preset categories** — Keep regular prompts separate from reusable fixed presets.
-* **Runtime placeholders** — Define user inputs with `=====REPLACE: Name=====`.
-* **Reusable fixed presets** — Embed shared content with `=====IMPORT: Preset Name=====`.
-* **Recursive imports** — Fixed presets can import other fixed presets, with circular-import protection.
-* **Remembered inputs** — Preserve the latest placeholder values for each prompt.
-* **Quick copy** — Render a prompt immediately using its previously saved values.
-* **Groups, pinning, and drag-and-drop ordering** — Create first-level groups, move prompts into groups, pin frequently used entries, and reorder prompts within the same group or pinned area.
-* **Markdown editor** — Common actions for headings, bold, italic, code, quotes, lists, links, and code blocks.
-* **Markdown highlighting** — Lightweight highlighting for headings, markers, inline code, and emphasis.
-* **Section folding** — Collapse and expand content according to Markdown heading hierarchy.
-* **IDE-like editing shortcuts** — Expand selections, copy or cut whole lines, and move lines.
-* **Import completion** — Complete fixed-preset names while entering an `IMPORT` marker, including matching Chinese names by Pinyin initials.
-* **Temporary text panel** — Keep persistent scratch text next to the prompt editor.
-* **Configurable shortcuts** — Customize application shortcuts from the settings dialog.
-* **Local SQLite storage** — Store prompts, groups, remembered values, and settings in a local database.
-* **Legacy database migration** — Discover older database locations on first launch, or specify a legacy database path through a command-line option or environment variable.
+### Quick Start
 
-## Tech Stack
+#### Prerequisites
 
-| Component          | Purpose                                       |
-| ------------------ | --------------------------------------------- |
-| Python 3.10+       | Application runtime                           |
-| PySide6 6.6+ / < 7 | Qt desktop user interface                     |
-| SQLite             | Local persistence                             |
-| setuptools         | Python package build system                   |
-| PyInstaller        | Optional single-file desktop executable build |
+- Python 3.10 or newer
+- A desktop environment supported by PySide6 (Windows / macOS / Linux)
 
-SQLite is accessed through Python's standard-library `sqlite3` module and does not require a separate database server.
-
-## Architecture
-
-The application uses a small layered architecture:
-
-```text
-PySide6 UI / Markdown Editor
-            │
-            ▼
-       PromptService
-      ┌─────┴─────┐
-      ▼           ▼
-Placeholder    PromptRepository
- Rendering          │
-                    ▼
-                  SQLite
-```
-
-`PromptService` connects the UI and persistence layer and centralizes validation, placeholder parsing, recursive preset expansion, and final prompt rendering.
-
-## Project Structure
-
-```text
-.
-├── build.py                 # PyInstaller executable build script
-├── launcher.py              # PyInstaller launcher
-├── pyproject.toml           # Project metadata, dependencies, and CLI entry point
-├── README.md
-└── prompt_manager/
-    ├── __init__.py          # Package metadata and version
-    ├── __main__.py          # python -m prompt_manager entry point
-    ├── app.py               # Application bootstrap and CLI arguments
-    ├── editor.py            # Markdown editor, highlighting, folding, and completion
-    ├── models.py            # Prompt domain model
-    ├── placeholders.py      # REPLACE / IMPORT parsing and replacement
-    ├── service.py           # Business logic, validation, and prompt rendering
-    ├── storage.py           # SQLite persistence layer
-    └── ui.py                # PySide6 main window and interaction logic
-```
-
-## Getting Started
-
-### Prerequisites
-
-* Python 3.10 or later
-* A desktop operating system supported by PySide6
-
-### Installation
+#### Install and Run
 
 ```bash
 # 1. Clone the repository
 git clone <repository-url>
+cd prompt-manager
 
-# 2. Enter the project directory
-cd <project-directory>
-
-# 3. Create a virtual environment
+# 2. Create and activate a virtual environment (optional but recommended)
 python -m venv .venv
-
-# 4. Activate the virtual environment
 # Windows
 .venv\Scripts\activate
-
 # macOS / Linux
 source .venv/bin/activate
 
-# 5. Install the project
+# 3. Install dependencies
 python -m pip install -e .
+
+# 4. Start the application
+python -m prompt_manager
 ```
 
-The required PySide6 dependency is installed from `pyproject.toml`.
-
-### Running
-
-After installation, start the application with the installed command:
+Once installed as a package, the console entry point is also available:
 
 ```bash
 prompt-manager
 ```
 
-Alternatively, run the Python module directly:
+### Building a Single-File Executable
+
+`build.py` wraps PyInstaller to produce a single-file windowed executable in `dist/`:
 
 ```bash
-python -m prompt_manager
+python -m pip install pyinstaller
+python build.py
 ```
 
-## Configuration
+User data is never bundled into the executable; upgrades keep using `prompts.sqlite3` in the platform data directory.
+
+### Command-Line Options
+
+| Option | Description |
+| --- | --- |
+| `--data-dir PATH` | Override the persistent directory used for the SQLite database |
+| `--migrate-from PATH` | Import an existing legacy database on first launch |
 
 ### Data Directory
 
-Prompt Manager stores its data in a platform data directory by default. The database file is named:
+The database file is always named `prompts.sqlite3` and defaults to:
 
-```text
-prompts.sqlite3
-```
+| Platform | Path |
+| --- | --- |
+| Windows | `%APPDATA%\PromptManager\prompts.sqlite3` |
+| macOS | `~/Library/Application Support/PromptManager/prompts.sqlite3` |
+| Linux | `$XDG_DATA_HOME/prompt-manager/prompts.sqlite3` (default `~/.local/share/prompt-manager/prompts.sqlite3`) |
 
-The default data directory depends on the operating system:
+On first launch, if the new database does not exist yet, the application looks for databases left behind by older releases next to the executable, in the working directory, and in the package directory, then migrates the first match. The original file is left untouched.
 
-| Platform     | Default directory                                                                |
-| ------------ | -------------------------------------------------------------------------------- |
-| Windows      | `%APPDATA%\PromptManager`                                                        |
-| macOS        | `~/Library/Application Support/PromptManager`                                    |
-| Linux / Unix | `$XDG_DATA_HOME/prompt-manager`, falling back to `~/.local/share/prompt-manager` |
+### Configuration and Environment Variables
 
-Override the default data directory with the following environment variable:
+| Variable | Purpose | Required |
+| --- | --- | --- |
+| `PROMPT_MANAGER_DATA_DIR` | Override the default data directory | No |
+| `PROMPT_MANAGER_LEGACY_DATABASE` | Point at a legacy database to migrate | No |
+| `OPENAI_API_KEY` | Used when the provider is OpenAI and no key is entered in settings | No |
+| `GEMINI_API_KEY` | Used when the provider is Gemini and no key is entered in settings | No |
 
-```bash
-PROMPT_MANAGER_DATA_DIR=/path/to/data prompt-manager
-```
+The Agent API key is kept for the current run only and is never written to the local database. Ollama runs locally and needs no key.
 
-You can also specify the directory when launching the application:
+### Usage
 
-```bash
-prompt-manager --data-dir /path/to/data
-```
+#### Placeholders and Fixed Presets
 
-or:
-
-```bash
-python -m prompt_manager --data-dir /path/to/data
-```
-
-The command-line option takes precedence over the platform-specific default location.
-
-### Legacy Database Migration
-
-On first launch, when the target database does not exist yet, Prompt Manager can migrate an older database. Use `--migrate-from` to specify the legacy database path explicitly:
-
-```bash
-prompt-manager --migrate-from /path/to/legacy/prompts.sqlite3
-```
-
-You can also provide the legacy database path through an environment variable:
-
-```bash
-PROMPT_MANAGER_LEGACY_DATABASE=/path/to/legacy/prompts.sqlite3 prompt-manager
-```
-
-The application also checks common legacy database names in the executable directory, current working directory, package root, and PyInstaller extraction directory.
-
-### Application Settings
-
-The settings dialog allows you to change application shortcuts and the display length of names in the navigation column. Settings are persisted locally in the database.
-
-Temporary text is also saved automatically and restored on subsequent launches.
-
-## Usage
-
-### 1. Create a Prompt
-
-Start the application, select **提示词预设** (Prompt Presets), and create a new entry with a name and Markdown content.
-
-Changes are saved automatically.
-
-For example:
+Use two marker forms inside prompt content:
 
 ```markdown
 # Code Review
 
-Review the following code:
+=====REPLACE: language=====
 
-=====REPLACE: Code=====
+Please review the following =====REPLACE: language===== code.
 
-Pay particular attention to:
-
-=====REPLACE: Review Focus=====
+=====IMPORT: code quality rules=====
 ```
 
-When you use the prompt, Prompt Manager creates an input field for each placeholder. After entering the values, the rendered prompt is copied to the system clipboard.
+- `=====REPLACE: title=====` opens a fill dialog when the prompt is used; the value replaces the marker and is remembered.
+- `=====IMPORT: name=====` looks up a `fixed` preset by name and expands it recursively. Cyclic imports render as `[循环导入: name]`.
 
-Previously entered values are stored and restored the next time the same prompt is used.
+The editor toolbar and the “杂项” menu insert both marker types, and typing an import marker triggers fixed preset completion.
 
-### 2. Replacement Placeholders
+#### Using a Prompt
 
-Use the following syntax to define an input:
+- Click the copy button on a list row, or press Shift twice in quick succession, to open the use dialog.
+- Prompts without placeholders are rendered and copied directly; prompts with placeholders open the fill dialog first.
+- The optimize menu renders the current prompt first, then prepends an optimization instruction before copying, with separate “no file” and “with file” variants.
+
+#### Agent Panel
+
+Open the conversation panel with the `Agent` button at the bottom left, then configure a provider under Settings → Agent 设置:
+
+| Provider | Default API base URL | Default model |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| Ollama | `http://localhost:11434/v1` | `qwen2.5:7b` |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.0-flash` |
+
+With Ollama selected, opening the model dropdown fetches installed models from the local `/api/tags` endpoint. Available Agent tools:
+
+- List, read, create, update, delete, and select prompts
+- List and create groups
+- Assign a prompt to a group, or clear its group
+
+Deletion only happens when the conversation explicitly asks for it. The Agent panel also accepts local text files by drag and drop or file picker, limited to 1 MiB per file and 4 MiB in total.
+
+#### Default Shortcuts
+
+| Action | Default shortcut |
+| --- | --- |
+| Insert replace placeholder | `Ctrl+Alt+R` |
+| Insert import placeholder | `Ctrl+Alt+I` |
+| Open settings | `Ctrl+,` |
+| Find | `Ctrl+F` |
+| Find and replace | `Ctrl+R` |
+| Expand selection | `Ctrl+W` |
+| Copy line (no selection) | `Ctrl+C` |
+| Cut line (no selection) | `Ctrl+X` |
+| Move line up | `Alt+Shift+Up` |
+| Move line down | `Alt+Shift+Down` |
+| Fold current section | `Ctrl+-` |
+| Unfold current section | `Ctrl++` |
+| Unfold current section recursively | `Ctrl+Alt++` |
+| Expand all sections | `Ctrl+Shift++` |
+| Collapse all sections | `Ctrl+Shift+-` |
+
+Editor shortcuts only fire while the content editor has focus, and every shortcut can be rebound in settings.
+
+#### Database Backup
+
+The “备份数据库” button at the top of the Agent panel creates a snapshot in the background under a date-named subdirectory of the data directory, for example `25-01-01/prompts.sqlite3`. Repeated backups on the same day atomically replace that day's snapshot.
+
+### Project Structure
 
 ```text
-=====REPLACE: Placeholder Name=====
+prompt-manager/
+├── prompt_manager/
+│   ├── __init__.py           # Package version
+│   ├── __main__.py           # python -m prompt_manager entry point
+│   ├── app.py                # Application entry, CLI options, database setup
+│   ├── ui.py                 # Main window, navigation list, groups, settings, Agent tool execution
+│   ├── editor.py             # Markdown editor: highlighting, folding, find/replace, import completion
+│   ├── agent.py              # OpenAI-compatible requests and bounded tool definitions
+│   ├── agent_panel.py        # Embedded Agent conversation panel and attachments
+│   ├── service.py            # Use cases: validation, rendering, grouping, backup
+│   ├── storage.py            # SQLite repository, schema migration, legacy import
+│   ├── models.py             # Prompt / PromptGroup data models
+│   └── placeholders.py       # Placeholder and import marker parsing and rendering
+├── launcher.py               # PyInstaller entry point
+├── build.py                  # Single-file executable build script
+└── pyproject.toml            # Project metadata and dependencies
 ```
 
-For example:
+### License
 
-```markdown
-Create a technical design for:
-
-=====REPLACE: Topic=====
-
-Target users:
-
-=====REPLACE: Target Users=====
-```
-
-A repeated placeholder name only needs one value. That value is substituted into every matching marker in the prompt.
-
-### 3. Fixed Presets
-
-Fixed presets contain content intended for reuse across multiple prompts, such as coding conventions, output requirements, or common instructions.
-
-Create a fixed preset named `Code Quality Requirements`:
-
-```markdown
-Make sure that:
-
-- The code has a clear structure
-- Names are readable
-- Unnecessary duplication is avoided
-- Important design decisions are explained
-```
-
-Reference it from a regular prompt:
-
-```markdown
-Implement the following requirement:
-
-=====REPLACE: Requirement=====
-
-## Code Quality
-
-=====IMPORT: Code Quality Requirements=====
-```
-
-When the prompt is rendered, the `IMPORT` marker is replaced with the complete contents of the matching fixed preset.
-
-If the referenced fixed preset does not exist, the original `IMPORT` marker remains in the rendered text.
-
-### 4. Compose Fixed Presets
-
-Fixed presets can recursively import other fixed presets, allowing smaller reusable rules to be composed into larger templates.
-
-For example:
-
-```markdown
-=====IMPORT: Python Conventions=====
-
-=====IMPORT: Output Format=====
-```
-
-Prompt Manager recursively expands these references.
-
-If presets form an import cycle, expansion stops at the cycle and inserts a circular-import marker instead of recursing indefinitely.
-
-### 5. Groups, Pinning, and Ordering
-
-You can create first-level groups in the sidebar and move prompts into a group through the group button on each row.
-
-Frequently used prompts can be pinned. Pinned entries appear in the pinned area of the list.
-
-Within the same group or pinned area, you can drag prompts to adjust their order. Dragging a pinned entry into a group moves it into that group and unpins it.
-
-When a group is deleted, its prompts are kept and moved to the ungrouped area.
-
-### 6. Quick Copy
-
-The **复制** (Copy) action beside a prompt renders it using its previously remembered placeholder values and immediately copies the result to the clipboard.
-
-Prompts without `REPLACE` placeholders can be rendered and copied directly without opening an input dialog.
-
-### 7. Temporary Text
-
-The **临时文本** (Temporary Text) button opens a persistent scratch area next to the main editor.
-
-Its contents are automatically saved locally and restored on subsequent application launches.
-
-## Markdown Editor
-
-The built-in editor provides common Markdown editing actions:
-
-| Action              | Behavior                   |
-| ------------------- | -------------------------- |
-| H1 / H2 / H3        | Insert a Markdown heading  |
-| Bold                | Wrap text in `**`          |
-| Italic              | Wrap text in `*`           |
-| Code                | Wrap text in backticks     |
-| Quote               | Insert `> `                |
-| List                | Insert `- `                |
-| Link                | Insert a Markdown link     |
-| Code block          | Insert a fenced code block |
-| Replace placeholder | Insert a `REPLACE` marker  |
-| Import placeholder  | Insert an `IMPORT` marker  |
-
-The editor also provides lightweight syntax highlighting for Markdown headings, placeholders, inline code, and emphasized text.
-
-### Keyboard Shortcuts
-
-Built-in editor shortcuts:
-
-| Shortcut       | Action                                         |
-| -------------- | ---------------------------------------------- |
-| `Ctrl+W`       | Expand the current selection                   |
-| `Ctrl+C`       | Copy the current line when nothing is selected |
-| `Ctrl+X`       | Cut the current line when nothing is selected  |
-| `Alt+Shift+↑`  | Move the current line up                       |
-| `Alt+Shift+↓`  | Move the current line down                     |
-| `Ctrl+-`       | Collapse the current Markdown section          |
-| `Ctrl++`       | Expand the current section                     |
-| `Ctrl+Alt++`   | Recursively expand the current section         |
-| `Ctrl+Shift++` | Expand all sections                            |
-| `Ctrl+Shift+-` | Collapse all sections                          |
-
-Default application shortcuts:
-
-| Shortcut     | Action                    |
-| ------------ | ------------------------- |
-| `Ctrl+Alt+R` | Insert a `REPLACE` marker |
-| `Ctrl+Alt+I` | Insert an `IMPORT` marker |
-| `Ctrl+,`     | Open settings             |
-
-Application shortcuts can be changed from the settings dialog and are persisted locally.
-
-## Data Storage
-
-Prompt Manager stores its data in an SQLite database named:
-
-```text
-prompts.sqlite3
-```
-
-The database stores:
-
-* Prompts and fixed presets
-* First-level groups
-* Remembered placeholder values for each prompt
-* Application settings and temporary text
-
-SQLite runs in WAL journal mode with foreign-key enforcement enabled.
-
-## Building a Desktop Executable
-
-The project includes `build.py` and a dedicated `launcher.py` for building a single-file, windowed desktop executable with PyInstaller.
-
-Install PyInstaller before building:
-
-```bash
-python -m pip install PyInstaller
-```
-
-Then run:
-
-```bash
-python build.py
-```
-
-The build script uses PyInstaller's single-file windowed mode and names the application `PromptManager`.
-
-A successful build is written to:
-
-```text
-dist/
-```
-
-User data is not bundled into the executable. When upgrading the application, it continues to use `prompts.sqlite3` in the system data directory.
-
-## License
-
-This project is licensed under the MIT License.
+This project is released under the MIT License.
