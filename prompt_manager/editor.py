@@ -408,12 +408,24 @@ class MarkdownEditor(QPlainTextEdit):
         # can occasionally reach the editor as well.  Consume it explicitly
         # so selecting an import with the arrow keys and pressing Enter never
         # inserts an unintended newline.
+        #
+        # Note: ``QCompleter.currentCompletion()`` is not reliable here.  The
+        # import popup intentionally uses an empty completion prefix (the user
+        # filters by typing after the marker, not as a completer prefix), and
+        # when the prefix is empty the completer's internal current index can
+        # stay pinned to the first candidate even after the user navigates the
+        # popup with the arrow keys.  That is what caused Enter to always
+        # insert the first candidate.  The popup view's ``currentIndex`` is
+        # the authoritative source of the row the user actually highlighted,
+        # so prefer it and fall back to ``currentCompletion()`` only when the
+        # view has no valid selection.
         if self._completer.popup().isVisible() and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            completion = self._completer.currentCompletion()
+            completion = ""
+            popup_index = self._completer.popup().currentIndex()
+            if popup_index.isValid():
+                completion = str(popup_index.data() or "")
             if not completion:
-                index = self._completer.popup().currentIndex()
-                if index.isValid():
-                    completion = str(index.data())
+                completion = self._completer.currentCompletion()
             if completion:
                 self._complete_import(completion)
                 event.accept()
