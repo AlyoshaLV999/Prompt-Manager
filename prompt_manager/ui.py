@@ -1345,11 +1345,21 @@ class MainWindow(QMainWindow):
         self.meta_label.setText(f"{placeholders} 个输入 · {imports} 个导入")
 
     def _unique_new_prompt_name(self) -> str:
-        """Return a free ``新建提示词`` name for the active category."""
+        """Return a free ``新建提示词`` name across all prompt categories.
+
+        The ``prompts`` table enforces a global ``UNIQUE(name)`` constraint,
+        so prompts from different categories cannot share the same name.
+        The previous implementation restricted the availability check to
+        :attr:`current_kind`; when the *other* category already held the
+        default name, the pre-flight check reported it as free and the
+        subsequent ``INSERT`` failed with the ``提示词名称已存在`` error
+        surfaced by the storage layer.  Querying without a category filter
+        keeps the check aligned with the actual database constraint.
+        """
 
         candidate = DEFAULT_NEW_PROMPT_NAME
         index = 2
-        while self.service.find_prompt_by_name(candidate, self.current_kind) is not None:
+        while self.service.find_prompt_by_name(candidate) is not None:
             candidate = f"{DEFAULT_NEW_PROMPT_NAME} {index}"
             index += 1
         return candidate
