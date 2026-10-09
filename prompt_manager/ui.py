@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -17,8 +19,12 @@ from PySide6.QtWidgets import (
 )
 
 from .editor import MarkdownEditor
-from .agent import PROVIDER_DEFAULTS, AgentRequestError, fetch_ollama_models
+from .agent import (
+    GLM_KNOWN_MODELS, PROVIDER_DEFAULTS, AgentRequestError,
+    fetch_glm_models, fetch_ollama_models, provider_config,
+)
 from .agent_panel import AgentPanel
+from .database_maintenance import AgentBackupSession, DatabaseTaskThread, RestoreDatabaseDialog
 from .models import Prompt
 from .service import PromptService, ValidationError
 from .storage import StorageError
@@ -26,12 +32,14 @@ from .storage import StorageError
 
 APP_STYLESHEET = """
 QMainWindow, QDialog { background: #f5f6fa; color: #1f2430; }
-QFrame#Sidebar, QFrame#EditorCard, QFrame#ToolbarCard, QFrame#FillCard, QFrame#TemporaryCard,
-QWidget#AgentConversationCard {
+QFrame#Sidebar, QFrame#EditorCard, QFrame#ToolbarCard, QFrame#FillCard, QFrame#TemporaryCard {
     background: #ffffff; border: 1px solid #e6e8ef; border-radius: 16px;
 }
+QWidget#AgentConversationCard {
+    background: #ffffff; border: 1px solid #e6e8ef; border-radius: 12px;
+}
 QLabel#AppTitle { font-size: 20px; font-weight: 700; color: #151923; }
-QLabel#Subtitle, QLabel#Hint, QLabel#Meta { color: #737a8c; }
+QLabel#Subtitle, QLabel#Hint, QLabel#Meta { color: #596273; }
 QLineEdit, QTextEdit, QPlainTextEdit {
     background: #fbfbfd; border: 1px solid #dfe3eb; border-radius: 10px;
     padding: 8px 10px; selection-background-color: #8b7cf6;
@@ -70,6 +78,27 @@ QPushButton#PinButton:checked { background: #ffe49b; color: #795700; }
 QPushButton#GroupActionButton { padding: 2px 5px; border-radius: 7px; }
 QScrollBar:vertical { width: 8px; background: transparent; }
 QScrollBar::handle:vertical { background: #d5d8e2; border-radius: 4px; min-height: 28px; }
+QFrame#TranscriptEntry {
+    background: #ffffff; border: none; border-left: 2px solid #c5cad5;
+}
+QFrame#TranscriptEntry[entryRole="user"] { background: #faf8ff; border-left-color: #8c79e7; }
+QFrame#TranscriptEntry[entryRole="tool"] { background: #f7f8fb; border-left-color: #687891; }
+QFrame#TranscriptEntry[entryRole="system"] { background: #fffaf1; border-left-color: #9b7440; }
+QToolButton#TranscriptToggle {
+    background: transparent; color: #46546b;
+    border: 1px solid transparent; border-radius: 6px; padding: 0;
+}
+QToolButton#TranscriptToggle:hover { background: #e9ebf4; color: #28354b; }
+QToolButton#TranscriptToggle:pressed { background: #dedff0; }
+QToolButton#TranscriptToggle:focus { border-color: #6558cb; }
+QLabel#TranscriptSpeaker { color: #313d53; font-size: 12px; font-weight: 700; }
+QFrame#TranscriptEntry[entryRole="user"] QLabel#TranscriptSpeaker { color: #5141a3; }
+QFrame#TranscriptEntry[entryRole="system"] QLabel#TranscriptSpeaker { color: #75552b; }
+QLabel#TranscriptSummary { color: #526077; font-size: 12px; padding: 0; }
+QTextBrowser#TranscriptContent {
+    background: transparent; color: #1f2937; border: none; padding: 0;
+    selection-background-color: #8b7cf6;
+}
 """
 
 DEFAULT_SHORTCUTS = {
@@ -88,6 +117,7 @@ DEFAULT_SHORTCUTS = {
     "unfold_section_recursive": "Ctrl+Alt++",
     "expand_all": "Ctrl+Shift++",
     "collapse_all": "Ctrl+Shift+-",
+    "rename_row_item": "F2",
 }
 SHORTCUT_LABELS = {
     "insert_replace": "插入替换占位符",
@@ -105,6 +135,7 @@ SHORTCUT_LABELS = {
     "unfold_section_recursive": "递归展开当前段落",
     "expand_all": "展开全部段落",
     "collapse_all": "折叠全部段落",
+    "rename_row_item": "重命名条目",
 }
 DEFAULT_ITEM_NAME_MAX_LENGTH = 10
 DEFAULT_NEW_PROMPT_NAME = "新建提示词"
@@ -118,36 +149,25 @@ ITEM_SECTION = "section"
 logger = logging.getLogger(__name__)
 
 
-class _DatabaseBackupThread(QThread):
-    """Create an SQLite snapshot away from the GUI thread."""
-
-    completed = Signal(object, str)
-
-    def __init__(self, service: PromptService) -> None:
-        super().__init__()
-        self.service = service
-
-    def run(self) -> None:
-        try:
-            destination = self.service.backup_database()
-        except StorageError as exc:
-            self.completed.emit(None, str(exc))
-        else:
-            self.completed.emit(destination, "")
-
-
 class _ModelFetchThread(QThread):
-    """Query a local Ollama server for its installed models."""
+    """Query a model provider (Ollama or GLM) for available models."""
 
     completed = Signal(object, str)
 
-    def __init__(self, base_url: str, parent: QWidget | None = None) -> None:
+    def __init__(self, base_url: str, api_key: str = "", provider: str = "ollama", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.base_url = base_url
+        self.api_key = api_key
+        self.provider = provider
 
     def run(self) -> None:
         try:
-            models = fetch_ollama_models(self.base_url)
+            if self.provider == "ollama":
+                models = fetch_ollama_models(self.base_url)
+            elif self.provider == "glm":
+                models = fetch_glm_models(self.base_url, self.api_key)
+            else:
+                raise AgentRequestError(f"不支持的模型服务商: {self.provider}")
         except AgentRequestError as exc:
             self.completed.emit(None, str(exc))
         else:
@@ -195,6 +215,9 @@ class PromptListWidget(QListWidget):
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # Drop recorded by :meth:`dropEvent` and emitted by :meth:`startDrag`
+        # once the drag has finished; see :meth:`startDrag` for the reason.
+        self._pending_drop: tuple[str, int, int] | None = None
 
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
         """Translate a drop into group assignment or same-bucket reordering."""
@@ -207,16 +230,40 @@ class PromptListWidget(QListWidget):
         if source.data(ITEM_TYPE_ROLE) != ITEM_PROMPT:
             event.ignore()
             return
-        source_id = int(source.data(PROMPT_ID_ROLE))
         target_type = target.data(ITEM_TYPE_ROLE)
-        if target_type == ITEM_GROUP:
-            self.prompt_dropped_on_group.emit(source_id, int(target.data(PROMPT_ID_ROLE)))
-        elif target_type == ITEM_PROMPT:
-            self.prompt_dropped.emit(source_id, int(target.data(PROMPT_ID_ROLE)))
-        else:
+        if target_type not in (ITEM_GROUP, ITEM_PROMPT):
             event.ignore()
             return
+        self._pending_drop = (
+            target_type,
+            int(source.data(PROMPT_ID_ROLE)),
+            int(target.data(PROMPT_ID_ROLE)),
+        )
         event.acceptProposedAction()
+
+    def startDrag(self, supported_actions: Qt.DropActions) -> None:  # noqa: N802 - Qt override
+        """Emit the recorded drop after the drag has fully unwound.
+
+        ``QAbstractItemView`` deletes the dragged rows from its model once a drop
+        reports a move, and it does so *after* ``dropEvent`` returns.  Rebuilding
+        the list from the database inside ``dropEvent`` therefore threw away the
+        row that the rebuild had just moved into its group, so the entry only
+        reappeared when something rebuilt the list again — which is why a group
+        had to be collapsed and expanded before the moved entry showed up.
+        Emitting here keeps that rebuild as the last change to the list, because
+        the slots rebuild it from the database after Qt is done with the drop.
+        """
+
+        self._pending_drop = None
+        super().startDrag(supported_actions)
+        pending_drop, self._pending_drop = self._pending_drop, None
+        if pending_drop is None:
+            return
+        target_type, source_id, target_id = pending_drop
+        if target_type == ITEM_GROUP:
+            self.prompt_dropped_on_group.emit(source_id, target_id)
+        else:
+            self.prompt_dropped.emit(source_id, target_id)
 
 
 class PromptListRow(QWidget):
@@ -509,13 +556,22 @@ class FillPromptDialog(QDialog):
 class SettingsDialog(QDialog):
     """Edit application shortcuts and OpenAI-compatible Agent settings."""
 
-    def __init__(self, service: PromptService, shortcuts: dict[str, str], parent=None) -> None:
+    def __init__(self, service: PromptService, shortcuts: dict[str, str], parent=None,
+                 api_keys: dict[str, str] | None = None) -> None:
         super().__init__(parent)
         self.service = service
         self.shortcut_edits: dict[str, QKeySequenceEdit] = {}
         self.api_key_value = ""
         self._model_thread: _ModelFetchThread | None = None
+        self._model_refresh_pending = False
+        self._provider_config: dict[str, dict[str, str]] = {}
         settings = service.settings()
+        for name in PROVIDER_DEFAULTS:
+            url, model = provider_config(settings, name)
+            self._provider_config[name] = {
+                "base_url": url, "model": model,
+                "api_key": (api_keys or {}).get(name, ""),
+            }
         try:
             item_name_max_length = int(settings.get("item_name_max_length", DEFAULT_ITEM_NAME_MAX_LENGTH))
         except (TypeError, ValueError):
@@ -544,7 +600,7 @@ class SettingsDialog(QDialog):
         self.item_name_length_edit.setSuffix(" 个字符")
         self.item_name_length_edit.setToolTip("导航栏中条目和分组名称超过此长度时显示省略号")
         form.addRow("名称显示长度", self.item_name_length_edit)
-        shortcuts_tip = QLabel("编辑器快捷键仅在编辑内容区域获得焦点时生效。")
+        shortcuts_tip = QLabel("编辑器快捷键在内容编辑区或临时文本区获得焦点时生效。")
         shortcuts_tip.setObjectName("Hint")
         shortcuts_tip.setWordWrap(True)
         form.addRow(shortcuts_tip)
@@ -556,35 +612,45 @@ class SettingsDialog(QDialog):
         self.agent_provider_edit.addItem("OpenAI", "openai")
         self.agent_provider_edit.addItem("Ollama", "ollama")
         self.agent_provider_edit.addItem("Gemini", "gemini")
+        self.agent_provider_edit.addItem("GLM", "glm")
         provider = settings.get("agent_provider", "openai")
         if provider not in PROVIDER_DEFAULTS:
             provider = "openai"
         provider_index = self.agent_provider_edit.findData(provider)
         self.agent_provider_edit.setCurrentIndex(max(0, provider_index))
         agent_form.addRow("服务商", self.agent_provider_edit)
-        self.agent_base_url_edit = QLineEdit(settings.get("agent_base_url", PROVIDER_DEFAULTS[provider][0]))
+        self.agent_base_url_edit = QLineEdit(self._provider_config[provider]["base_url"])
         self.agent_base_url_edit.setPlaceholderText("OpenAI 兼容 API 基础地址")
         agent_form.addRow("API 地址", self.agent_base_url_edit)
         self.agent_model_edit = _ModelComboBox()
-        self.agent_model_edit.setCurrentText(settings.get("agent_model", PROVIDER_DEFAULTS[provider][1]))
+        self.agent_model_edit.setCurrentText(self._provider_config[provider]["model"])
         line_edit = self.agent_model_edit.lineEdit()
         if line_edit is not None:
             line_edit.setPlaceholderText("模型名称（可直接输入或从下拉列表选择）")
         self.agent_model_edit.setToolTip(
-            "选择 Ollama 服务商时，展开下拉框会自动获取本地已安装的模型列表；"
-            "其他服务商仍可直接输入模型名称。"
+            "Ollama 和 GLM 可从下拉列表选择模型；也可以直接输入模型名称。"
         )
         self.agent_model_edit.refresh_requested.connect(self._refresh_agent_models)
         agent_form.addRow("模型", self.agent_model_edit)
-        self._agent_provider = provider
-        self.agent_provider_edit.currentIndexChanged.connect(self._update_agent_provider_defaults)
+        self.model_status_label = QLabel()
+        self.model_status_label.setObjectName("Meta")
+        agent_form.addRow("", self.model_status_label)
+
         self.agent_api_key_edit = QLineEdit()
         self.agent_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.agent_api_key_edit.setPlaceholderText("留空时读取 OPENAI_API_KEY 或 GEMINI_API_KEY")
+        self.agent_api_key_edit.setPlaceholderText("留空时读取 OPENAI_API_KEY / GEMINI_API_KEY / GLM_API_KEY")
+        self.agent_api_key_edit.setText(self._provider_config[provider]["api_key"])
         agent_form.addRow("API Key（本次运行）", self.agent_api_key_edit)
+        self._agent_provider = provider
+        self.agent_provider_edit.currentIndexChanged.connect(self._update_agent_provider_defaults)
+        self._set_model_options(GLM_KNOWN_MODELS if provider == "glm" else [])
+        self.model_status_label.setText("可选择建议模型，或输入自己的模型名称" if provider == "glm" else "")
+        if provider in ("ollama", "glm"):
+            self._refresh_agent_models()
         tip = QLabel(
-            "API Key 只保存在本次运行内，不写入本地数据库。Gemini 使用 OpenAI 兼容接口。"
-            "Ollama 模型列表通过本机 /api/tags 获取，需要本地服务已启动。"
+            "API Key 只保存在本次运行内，不写入本地数据库。"
+            "Gemini 使用 OpenAI 兼容接口。GLM 使用智谱 AI 平台 OpenAI 兼容接口。"
+            "Ollama 模型列表通过本机 /api/tags 获取；GLM 提供模型建议，填写 Key 后可获取服务端列表。"
         )
         tip.setObjectName("Hint")
         tip.setWordWrap(True)
@@ -597,50 +663,99 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-    def _update_agent_provider_defaults(self) -> None:
-        """Keep default endpoint and model aligned with a provider change."""
+    def _save_provider_config(self, provider: str) -> None:
+        """Save the current values for the given provider to the per-provider cache.
 
-        provider = str(self.agent_provider_edit.currentData())
-        old_url, old_model = PROVIDER_DEFAULTS[self._agent_provider]
-        new_url, new_model = PROVIDER_DEFAULTS[provider]
-        if self.agent_base_url_edit.text().strip() == old_url:
-            self.agent_base_url_edit.setText(new_url)
-        if self.agent_model_edit.currentText().strip() == old_model:
-            self.agent_model_edit.setCurrentText(new_model)
-        self._agent_provider = provider
-        if provider == "ollama":
+        This cache persists across provider switches so that users can switch
+        back to OpenAI and see their previous OpenAI settings (URL, model,
+        API key) instead of OpenAI's default values.
+        """
+
+        config = {
+            "base_url": self.agent_base_url_edit.text().strip(),
+            "model": self.agent_model_edit.currentText().strip(),
+            "api_key": self.agent_api_key_edit.text().strip(),
+        }
+        self._provider_config[provider] = config
+
+    def _load_provider_config(self, provider: str) -> None:
+        """Restore this provider's persisted or newly edited session values."""
+
+        config = self._provider_config[provider]
+        self.agent_base_url_edit.setText(config["base_url"])
+        self.agent_model_edit.setCurrentText(config["model"])
+        self.agent_api_key_edit.setText(config["api_key"])
+
+    def _update_agent_provider_defaults(self) -> None:
+        """Save current provider config, restore target provider config, and fetch models if needed."""
+
+        target_provider = str(self.agent_provider_edit.currentData())
+        if target_provider == self._agent_provider:
+            return
+        self._save_provider_config(self._agent_provider)
+        self._load_provider_config(target_provider)
+        self._agent_provider = target_provider
+        self._set_model_options(GLM_KNOWN_MODELS if target_provider == "glm" else [])
+        self.model_status_label.setText("可选择建议模型，或输入自己的模型名称" if target_provider == "glm" else "")
+
+        # Fetch models if Ollama or GLM is selected.
+        if target_provider in ("ollama", "glm"):
             self._refresh_agent_models()
 
     def _refresh_agent_models(self) -> None:
-        """Fetch Ollama model names in the background when that provider is active."""
+        """Fetch the selected provider's models without blocking the dialog."""
 
-        if str(self.agent_provider_edit.currentData()) != "ollama":
+        provider = str(self.agent_provider_edit.currentData())
+        if provider not in ("ollama", "glm"):
             return
         if self._model_thread is not None and self._model_thread.isRunning():
+            self._model_refresh_pending = True
             return
         base_url = self.agent_base_url_edit.text().strip()
-        thread = _ModelFetchThread(base_url, self)
+        key = self.agent_api_key_edit.text().strip()
+        if provider == "glm":
+            key = key or os.environ.get("GLM_API_KEY", "")
+        if provider == "glm" and not key:
+            self._set_model_options(GLM_KNOWN_MODELS)
+            return
+        self.model_status_label.setText("正在获取模型列表…")
+        thread = _ModelFetchThread(base_url, key, provider, QApplication.instance())
         thread.completed.connect(self._on_agent_models_fetched)
         thread.finished.connect(self._on_model_thread_finished)
+        thread.finished.connect(thread.deleteLater)
         self._model_thread = thread
         thread.start()
 
     def _on_agent_models_fetched(self, models: object, error: str) -> None:
         """Replace the combo box entries with detected models, preserving user input."""
 
+        thread = self.sender()
+        if (thread is not self._model_thread or
+            thread.provider != str(self.agent_provider_edit.currentData()) or
+            thread.base_url != self.agent_base_url_edit.text().strip() or
+            thread.api_key != (self.agent_api_key_edit.text().strip() or
+                               (os.environ.get("GLM_API_KEY", "") if thread.provider == "glm" else ""))):
+            return
         if error:
-            logger.warning("Ollama 模型列表获取失败: %s", error)
+            logger.warning("%s 模型列表获取失败: %s", thread.provider, error)
+            self.model_status_label.setText("无法获取模型列表；可直接输入模型名称")
             return
         if not isinstance(models, list) or not models:
+            self.model_status_label.setText("服务端未返回模型；可直接输入模型名称")
             return
+        self._set_model_options([str(model) for model in models])
+        self.model_status_label.setText(f"已获取 {len(models)} 个模型")
+
+    def _set_model_options(self, names: list[str]) -> None:
+        """Update suggestions without replacing a custom model name."""
+
         combo = self.agent_model_edit
         current_text = combo.currentText().strip()
-        names = [str(model) for model in models]
         combo.blockSignals(True)
         try:
             combo.clear()
             combo.addItems(names)
-            combo.setCurrentText(current_text or names[0])
+            combo.setCurrentText(current_text)
         finally:
             combo.blockSignals(False)
 
@@ -648,8 +763,9 @@ class SettingsDialog(QDialog):
         thread = self.sender()
         if thread is self._model_thread:
             self._model_thread = None
-        if thread is not None:
-            thread.deleteLater()
+            if self._model_refresh_pending:
+                self._model_refresh_pending = False
+                self._refresh_agent_models()
 
     def _save(self) -> None:
         values = {key: edit.keySequence().toString() for key, edit in self.shortcut_edits.items()}
@@ -668,15 +784,21 @@ class SettingsDialog(QDialog):
                 return
             configured[normalized] = key
         values["item_name_max_length"] = str(self.item_name_length_edit.value())
+        self._save_provider_config(self._agent_provider)
         values["agent_provider"] = str(self.agent_provider_edit.currentData())
-        values["agent_base_url"] = self.agent_base_url_edit.text().strip()
-        values["agent_model"] = self.agent_model_edit.currentText().strip()
+        for provider, config in self._provider_config.items():
+            values[f"agent_{provider}_base_url"] = config["base_url"]
+            values[f"agent_{provider}_model"] = config["model"]
+        current = self._provider_config[self._agent_provider]
+        values["agent_base_url"] = current["base_url"]
+        values["agent_model"] = current["model"]
         try:
             self.service.save_settings(values)
         except StorageError as exc:
             QMessageBox.critical(self, "保存设置失败", str(exc))
             return
-        self.api_key_value = self.agent_api_key_edit.text().strip()
+        self.api_key_values = {name: config["api_key"] for name, config in self._provider_config.items()}
+        self.api_key_value = current["api_key"]
         self.accept()
 
 
@@ -691,12 +813,20 @@ class MainWindow(QMainWindow):
     def __init__(self, service: PromptService) -> None:
         super().__init__()
         self.service = service
+        # Safety copies taken before every Agent reply; they live for this run
+        # only and are removed again when the window closes.
+        self._agent_backups = AgentBackupSession(service)
         self.current_prompt_id: int | None = None
         self.current_kind = "prompt"
         self._collapsed_group_ids: dict[int, bool] = {}
         self.item_name_max_length = self._read_item_name_max_length(self.service.settings())
         self._loading_editor = False
         self._loading_temporary = False
+        # Every Markdown pane of the window, and the one the shared formatting
+        # actions currently target.  Both are filled in by ``_build_ui``; the
+        # empty default keeps event delivery safe before that happens.
+        self._markdown_editors: tuple[MarkdownEditor, ...] = ()
+        self._last_focused_editor: MarkdownEditor | None = None
         # Double Shift gesture state.
         #
         # ``_last_shift_press_time`` holds the monotonic time of the most
@@ -725,7 +855,7 @@ class MainWindow(QMainWindow):
         self.resize(1260, 820)
         self.setStyleSheet(APP_STYLESHEET)
         self._build_ui()
-        self._backup_thread: _DatabaseBackupThread | None = None
+        self._database_thread: DatabaseTaskThread | None = None
         self._install_shortcuts()
         self.refresh_prompt_list()
         # Application-level filter is required because the double Shift
@@ -801,7 +931,7 @@ class MainWindow(QMainWindow):
         self.temporary_text_button = QPushButton("临时文本")
         self.temporary_text_button.setObjectName("TemporaryButton")
         self.temporary_text_button.setCheckable(True)
-        self.temporary_text_button.setToolTip("打开或关闭持久保存的临时文本面板")
+        self.temporary_text_button.setToolTip("打开或关闭支持 Markdown 的临时文本面板")
         self.temporary_text_button.clicked.connect(self.toggle_temporary_text)
         new_button = QPushButton("新建")
         new_button.setObjectName("PrimaryButton")
@@ -861,15 +991,22 @@ class MainWindow(QMainWindow):
         temporary_layout.setContentsMargins(12, 12, 12, 12)
         temporary_label = QLabel("临时文本")
         temporary_label.setStyleSheet("font-size: 16px; font-weight: 700;")
-        self.temporary_text_edit = QTextEdit()
-        self.temporary_text_edit.setAcceptRichText(False)
-        self.temporary_text_edit.setPlaceholderText("这里的内容会自动保存，可作为临时记录区使用。")
+        # The scratch pane is the same Markdown editor as the prompt pane, so
+        # highlighting, folding, and the shared editing shortcuts behave the
+        # same in both.
+        self.temporary_text_edit = MarkdownEditor()
+        self.temporary_text_edit.setPlaceholderText(
+            "支持 Markdown。这里的内容会自动保存，可作为临时记录区使用。"
+        )
         self.temporary_text_edit.setPlainText(self.service.settings().get("temporary_text", ""))
         temporary_layout.addWidget(temporary_label)
         temporary_layout.addWidget(self.temporary_text_edit, 1)
         self.editing_splitter.addWidget(self.temporary_panel)
         self.temporary_panel.setVisible(False)
         self.editing_splitter.setSizes([1080, 900])
+        self._markdown_editors = (self.content_edit, self.temporary_text_edit)
+        for markdown_editor in self._markdown_editors:
+            markdown_editor.installEventFilter(self)
         editor_layout.addWidget(self.editing_splitter, 1)
         editor_layout.addLayout(self._build_format_toolbar())
         hint = QLabel("修改会自动保存。编辑器快捷键可在设置中查看和修改。")
@@ -919,17 +1056,21 @@ class MainWindow(QMainWindow):
             return DEFAULT_ITEM_NAME_MAX_LENGTH
 
     def _build_format_toolbar(self) -> QHBoxLayout:
-        """Build common Markdown actions and put less-used actions in a menu."""
+        """Build common Markdown actions and put less-used actions in a menu.
+
+        Every action modifies the Markdown pane that last had focus, so the
+        toolbar works for the prompt editor and the temporary editor alike.
+        """
 
         layout = QHBoxLayout()
         actions = (
-            ("H1", "在当前行添加一级标题", lambda: self.content_edit.prefix_current_line("# ")),
-            ("H2", "在当前行添加二级标题", lambda: self.content_edit.prefix_current_line("## ")),
-            ("粗体", "将选中文本包裹为 **文本**", lambda: self.content_edit.wrap_selection("**")),
-            ("斜体", "将选中文本包裹为 *文本*", lambda: self.content_edit.wrap_selection("*")),
-            ("代码", "将选中文本包裹为 `代码`", lambda: self.content_edit.wrap_selection("`")),
-            ("引用", "在当前行添加 > 引用符号", lambda: self.content_edit.prefix_current_line("> ")),
-            ("列表", "在当前行添加 - 列表符号", lambda: self.content_edit.prefix_current_line("- ")),
+            ("H1", "在当前行添加一级标题", lambda: self._active_editor().prefix_current_line("# ")),
+            ("H2", "在当前行添加二级标题", lambda: self._active_editor().prefix_current_line("## ")),
+            ("粗体", "将选中文本包裹为 **文本**", lambda: self._active_editor().wrap_selection("**")),
+            ("斜体", "将选中文本包裹为 *文本*", lambda: self._active_editor().wrap_selection("*")),
+            ("代码", "将选中文本包裹为 `代码`", lambda: self._active_editor().wrap_selection("`")),
+            ("引用", "在当前行添加 > 引用符号", lambda: self._active_editor().prefix_current_line("> ")),
+            ("列表", "在当前行添加 - 列表符号", lambda: self._active_editor().prefix_current_line("- ")),
         )
         for text, tip, callback in actions:
             button = QPushButton(text)
@@ -941,7 +1082,7 @@ class MainWindow(QMainWindow):
         more.setToolTip("更多 Markdown 格式与占位符操作")
         menu = QMenu(more)
         for text, callback in (
-            ("H3 标题", lambda: self.content_edit.prefix_current_line("### ")),
+            ("H3 标题", lambda: self._active_editor().prefix_current_line("### ")),
             ("链接 [文字](地址)", self.insert_link),
             ("代码块 ```", self.insert_code_block),
             ("插入替换占位符", lambda: self.insert_marker("replace")),
@@ -955,6 +1096,19 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return layout
 
+    def _active_editor(self) -> MarkdownEditor:
+        """Return the Markdown pane the shared editing actions must modify.
+
+        The prompt editor is the default so that every action keeps its
+        original target while the temporary pane is hidden or has never been
+        used.
+        """
+
+        editor = self._last_focused_editor
+        if editor is not None and editor.isVisible():
+            return editor
+        return self.content_edit
+
     def _install_shortcuts(self) -> None:
         settings = DEFAULT_SHORTCUTS | self.service.settings()
         for shortcut in self._shortcuts:
@@ -965,45 +1119,74 @@ class MainWindow(QMainWindow):
             "insert_replace": lambda: self.insert_marker("replace"),
             "insert_import": lambda: self.insert_marker("import"),
             "settings": self.open_settings,
+            "rename_row_item": self._trigger_row_rename,
         }
-        editor_actions = {
-            "find": self.content_edit.open_find_bar,
-            "replace": self.content_edit.open_replace_bar,
-            "expand_selection": self.content_edit.expand_selection,
-            "copy_line": lambda: self._copy_or_cut_editor_line(False),
-            "cut_line": lambda: self._copy_or_cut_editor_line(True),
-            "move_line_up": lambda: self.content_edit.move_current_line(-1),
-            "move_line_down": lambda: self.content_edit.move_current_line(1),
-            "fold_section": self.content_edit.collapse_section,
-            "unfold_section": lambda: self.content_edit.expand_section(recursive=False),
-            "unfold_section_recursive": lambda: self.content_edit.expand_section(recursive=True),
-            "expand_all": self.content_edit.expand_all,
-            "collapse_all": self.content_edit.collapse_all,
-        }
-        for key, callback in (global_actions | editor_actions).items():
+        # Global actions belong to the window; the editor actions are bound once
+        # per Markdown pane so that each of them only fires while that pane, or
+        # one of its children, holds the focus.
+        bindings: list[tuple[str, QWidget, Callable[[], None]]] = [
+            (key, self, callback) for key, callback in global_actions.items()
+        ]
+        for editor in self._markdown_editors:
+            bindings.extend(
+                (key, editor, callback) for key, callback in self._editor_actions(editor).items()
+            )
+        for key, parent, callback in bindings:
             sequence_text = settings.get(key, DEFAULT_SHORTCUTS[key])
             if not sequence_text.strip():
                 continue
-            parent = self if key in global_actions else self.content_edit
             shortcut = QShortcut(QKeySequence(sequence_text), parent)
             shortcut.setContext(
                 Qt.ShortcutContext.WindowShortcut
-                if key in global_actions
+                if parent is self
                 else Qt.ShortcutContext.WidgetWithChildrenShortcut
             )
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
 
-    def _copy_or_cut_editor_line(self, cut: bool) -> None:
+    def _editor_actions(self, editor: MarkdownEditor) -> dict[str, Callable[[], None]]:
+        """Return the editor shortcuts bound to one Markdown pane."""
+
+        return {
+            "find": editor.open_find_bar,
+            "replace": editor.open_replace_bar,
+            "expand_selection": editor.expand_selection,
+            "copy_line": lambda: self._copy_or_cut_editor_line(editor, False),
+            "cut_line": lambda: self._copy_or_cut_editor_line(editor, True),
+            "move_line_up": lambda: editor.move_current_line(-1),
+            "move_line_down": lambda: editor.move_current_line(1),
+            "fold_section": editor.collapse_section,
+            "unfold_section": lambda: editor.expand_section(recursive=False),
+            "unfold_section_recursive": lambda: editor.expand_section(recursive=True),
+            "expand_all": editor.expand_all,
+            "collapse_all": editor.collapse_all,
+        }
+
+    def _trigger_row_rename(self) -> None:
+        """Start inline renaming of the selected navigation entry.
+
+        Bound to a shortcut, F2 by default, and equivalent to double-clicking
+        the entry's title.  Group rows and an empty selection are ignored,
+        because only prompt entries are renamed in place.
+        """
+
+        current_item = self.prompt_list.currentItem()
+        if current_item is None or current_item.data(ITEM_TYPE_ROLE) != ITEM_PROMPT:
+            return
+        row_widget = self.prompt_list.itemWidget(current_item)
+        if isinstance(row_widget, PromptListRow):
+            row_widget._begin_rename()
+
+    def _copy_or_cut_editor_line(self, editor: MarkdownEditor, cut: bool) -> None:
         """Keep normal selected-text copy behavior and edit whole lines otherwise."""
 
-        if self.content_edit.textCursor().hasSelection():
-            (self.content_edit.cut if cut else self.content_edit.copy)()
+        if editor.textCursor().hasSelection():
+            (editor.cut if cut else editor.copy)()
             return
-        self.content_edit._copy_or_cut_current_line(cut)
+        editor._copy_or_cut_current_line(cut)
 
     def toggle_temporary_text(self) -> None:
-        """Show or hide the persistent temporary-text editor."""
+        """Show or hide the persistent temporary-text Markdown editor."""
 
         visible = not self.temporary_panel.isVisible()
         self.temporary_panel.setVisible(visible)
@@ -1436,31 +1619,37 @@ class MainWindow(QMainWindow):
     def insert_marker(self, kind: str) -> None:
         """Insert a marker at the cursor without blocking the editing flow."""
 
+        editor = self._active_editor()
         marker = "=====REPLACE: 标题=====" if kind == "replace" else "=====IMPORT: ====="
-        cursor = self.content_edit.textCursor()
+        cursor = editor.textCursor()
         marker_start = cursor.selectionStart() if cursor.hasSelection() else cursor.position()
         cursor.insertText(marker)
         # Leave the caret inside the marker, immediately before its closing
         # delimiter, so the suggested label can be edited in place.
         cursor.setPosition(marker_start + len(marker) - len("====="))
-        self.content_edit.setTextCursor(cursor)
-        self.content_edit.setFocus()
+        editor.setTextCursor(cursor)
+        editor.setFocus()
         if kind != "replace":
-            self.content_edit._update_import_completion()
+            editor._update_import_completion()
 
     def insert_link(self) -> None:
-        self.content_edit.wrap_selection("[", "](链接地址)")
+        self._active_editor().wrap_selection("[", "](链接地址)")
 
     def insert_code_block(self) -> None:
-        cursor = self.content_edit.textCursor()
+        editor = self._active_editor()
+        cursor = editor.textCursor()
         selected = cursor.selectedText()
         cursor.insertText(f"```\n{selected or '代码'}\n```")
-        self.content_edit.setTextCursor(cursor)
+        editor.setTextCursor(cursor)
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self.service, DEFAULT_SHORTCUTS | self.service.settings(), self)
-        dialog.agent_api_key_edit.setText(getattr(self, "_agent_api_key", ""))
+        keys = getattr(self, "_agent_api_keys", {}).copy()
+        if not keys and getattr(self, "_agent_api_key", ""):
+            active = self.service.settings().get("agent_provider", "openai")
+            keys[active] = self._agent_api_key
+        dialog = SettingsDialog(self.service, DEFAULT_SHORTCUTS | self.service.settings(), self, api_keys=keys)
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._agent_api_keys = dialog.api_key_values
             self._agent_api_key = dialog.api_key_value
             self.item_name_max_length = self._read_item_name_max_length(self.service.settings())
             self._install_shortcuts()
@@ -1479,14 +1668,63 @@ class MainWindow(QMainWindow):
     def start_database_backup(self) -> None:
         """Back up the live database without blocking the interface."""
 
-        if self._backup_thread is not None:
+        if self._database_thread is not None:
             return
-        self.agent_panel.backup_button.setEnabled(False)
+        self.agent_panel.set_database_actions_enabled(False)
         self.agent_panel.status_label.setText("正在备份数据库…")
-        self._backup_thread = _DatabaseBackupThread(self.service)
-        self._backup_thread.completed.connect(self._on_database_backup_completed)
-        self._backup_thread.finished.connect(self._on_database_backup_thread_finished)
-        self._backup_thread.start()
+        self._database_thread = DatabaseTaskThread(self.service.backup_database)
+        self._database_thread.completed.connect(self._on_database_backup_completed)
+        self._database_thread.finished.connect(self._on_database_task_finished)
+        self._database_thread.start()
+
+    def start_database_restore(self) -> None:
+        """Replace the live database with a snapshot chosen by the user.
+
+        The snapshot is applied on the GUI thread because SQLite's online backup
+        API runs on the connection this window already owns, and that connection
+        may only be used from the thread that created it.  Copying a local
+        snapshot is quick, and the wait cursor reports the operation while it
+        runs.
+        """
+
+        if self._database_thread is not None:
+            return
+        try:
+            backups = self.service.list_database_backups()
+        except StorageError as exc:
+            self._show_error(str(exc))
+            return
+        if not backups:
+            message = "没有可用的数据库备份，请先备份数据库"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 4000)
+            return
+        dialog = RestoreDatabaseDialog(backups, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        backup_path = dialog.selected_backup()
+        if backup_path is None:
+            return
+        # Debounced writes still in flight belong to the database being
+        # replaced; letting them fire afterwards would undo the restore.
+        self._autosave_timer.stop()
+        self._temporary_autosave_timer.stop()
+        self.agent_panel.set_database_actions_enabled(False)
+        self.agent_panel.status_label.setText(f"正在恢复 {backup_path.parent.name} 的备份…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            restored = self.service.restore_database(backup_path)
+        except StorageError as exc:
+            logger.warning("Database restore failed: %s", exc)
+            message = f"数据库恢复失败：{exc}"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 6000)
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.agent_panel.set_database_actions_enabled(True)
+        self.agent_panel.status_label.setText(f"已从 {restored.parent.name} 的备份恢复数据库")
+        self._refresh_after_database_restore()
 
     def _on_database_backup_completed(self, destination: object, error: str) -> None:
         if error:
@@ -1504,12 +1742,54 @@ class MainWindow(QMainWindow):
         self.agent_panel.status_label.setText(message)
         self.statusBar().showMessage(f"数据库已备份到：{backup_path}", 6000)
 
-    def _on_database_backup_thread_finished(self) -> None:
+    def _on_database_task_finished(self) -> None:
         thread = self.sender()
-        self._backup_thread = None
-        self.agent_panel.backup_button.setEnabled(True)
+        self._database_thread = None
+        self.agent_panel.set_database_actions_enabled(True)
         if thread is not None:
             thread.deleteLater()
+
+    def capture_agent_backup(self) -> None:
+        """Snapshot the database before the Agent generates a reply.
+
+        The snapshot is the way back from a tool call that damaged stored
+        prompts.  It is removed again when the window closes, so it only ever
+        covers the run that created it; a failure is reported without stopping
+        the generation, which would otherwise make the Agent unusable whenever
+        the backup folder is not writable.
+        """
+
+        try:
+            backup_path = self._agent_backups.capture()
+        except StorageError as exc:
+            logger.warning("Agent backup failed: %s", exc)
+            self.statusBar().showMessage(f"Agent 自动备份失败，本次生成没有可回滚的备份：{exc}", 6000)
+            return
+        if self._agent_backups.count == 1:
+            self.statusBar().showMessage(
+                f"本次运行已开启 Agent 自动备份（{backup_path.parent.name}/{backup_path.name}），关闭程序时会清理",
+                5000,
+            )
+        logger.debug("Agent snapshot created: %s", backup_path)
+
+    def _refresh_after_database_restore(self) -> None:
+        """Reload every view that reads from the restored database."""
+
+        settings = self.service.settings()
+        self.item_name_max_length = self._read_item_name_max_length(settings)
+        self._loading_temporary = True
+        try:
+            self.temporary_text_edit.setPlainText(settings.get("temporary_text", ""))
+        finally:
+            self._loading_temporary = False
+        self._install_shortcuts()
+        # The entry that was open may not exist in the restored database, and
+        # the editor must never keep showing pre-restore text that autosave
+        # could later write back over the restored content.
+        selected = self.current_prompt_id
+        self._clear_editor()
+        self.refresh_prompt_list(select_id=selected)
+        self.statusBar().showMessage("数据库已恢复，界面已刷新", 4000)
 
     def execute_agent_tool(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
         """Run one allow-listed Agent action on the GUI thread.
@@ -1704,7 +1984,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "无法完成操作", message)
 
     def eventFilter(self, obj: object, event: QEvent) -> bool:  # noqa: N802 - Qt override
-        """Open the fill dialog when Shift is pressed twice in quick succession.
+        """Track the focused Markdown pane and open the fill dialog on double Shift.
 
         The filter is installed on :class:`QApplication` so the gesture fires
         no matter which child widget owns the keyboard focus, as long as the
@@ -1725,6 +2005,13 @@ class MainWindow(QMainWindow):
             behaviour in the focused widget is preserved.
         """
 
+        if event.type() == QEvent.Type.FocusIn and any(
+                obj is editor for editor in self._markdown_editors
+        ):
+            # Remember which Markdown pane the user is working in.  The filter
+            # is installed on both panes so the shared formatting actions follow
+            # the focused pane even when it is the temporary one.
+            self._last_focused_editor = cast(MarkdownEditor, obj)
         if (
                 event.type() == QEvent.Type.KeyPress
                 and isinstance(obj, QWidget)
@@ -1764,8 +2051,10 @@ class MainWindow(QMainWindow):
         application = QApplication.instance()
         if application is not None:
             application.removeEventFilter(self)
-        if self._backup_thread is not None and self._backup_thread.isRunning():
-            self._backup_thread.wait()
+        if self._database_thread is not None and self._database_thread.isRunning():
+            self._database_thread.wait()
+        self.agent_panel.shutdown()
+        self._agent_backups.discard()
         self._autosave_timer.stop()
         self._temporary_autosave_timer.stop()
         self._auto_save()

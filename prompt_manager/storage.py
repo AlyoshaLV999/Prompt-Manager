@@ -11,6 +11,73 @@ from uuid import uuid4
 
 from .models import Prompt, PromptGroup
 
+# Snapshots written by :meth:`PromptRepository.backup_database` live in one
+# folder per day.  The folder name is both what identifies a backup directory
+# and what orders the list of restorable snapshots.
+BACKUP_DIRECTORY_FORMAT = "%y-%m-%d"
+# Snapshots taken automatically before an Agent reply carry this marker in
+# their file name.  It is what tells them apart from the snapshots the user
+# asked for, both in the restore list and in the session cleanup.
+AGENT_BACKUP_PREFIX = "agent-"
+AGENT_BACKUP_STAMP_FORMAT = "%H%M%S"
+
+
+def _backup_day(directory_name: str) -> datetime | None:
+    """Return the snapshot date encoded in a backup folder name, if any."""
+
+    try:
+        return datetime.strptime(directory_name, BACKUP_DIRECTORY_FORMAT)
+    except ValueError:
+        return None
+
+
+def is_agent_backup(path: Path) -> bool:
+    """Return whether a snapshot file name carries the Agent marker."""
+
+    return path.name.startswith(AGENT_BACKUP_PREFIX)
+
+
+def agent_backup_sequence(path: Path) -> int | None:
+    """Return the sequence number encoded in an Agent snapshot name.
+
+    Several snapshots of one run can share a minute, so the sequence is what
+    lets the user tell them apart in the restore dialog.
+
+    :param path: Snapshot file produced by
+        :meth:`PromptRepository.backup_agent_database`.
+    :return: The one-based sequence number inside its session, or ``None``
+        when the name does not carry one.
+    """
+
+    if not is_agent_backup(path):
+        return None
+    sequence = path.stem.rpartition("-")[2]
+    return int(sequence) if sequence.isdigit() else None
+
+
+def _snapshot_files(directory: Path, database_name: str) -> list[Path]:
+    """Return the restorable snapshots stored inside one backup folder."""
+
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    suffix = Path(database_name).suffix
+    return [
+        entry for entry in entries
+        if entry.is_file()
+        and (entry.name == database_name or (is_agent_backup(entry) and entry.suffix == suffix))
+    ]
+
+
+def _snapshot_time(path: Path) -> int:
+    """Return a snapshot's modification time in nanoseconds, or ``0``."""
+
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
 
 def utc_now() -> str:
     """Return a sortable UTC timestamp in ISO-8601 format."""
@@ -462,9 +529,59 @@ class PromptRepository:
         :raises StorageError: If the snapshot cannot be created or verified.
         """
 
-        backup_directory = self.database_path.parent / datetime.now().strftime("%y-%m-%d")
-        destination = backup_directory / self.database_path.name
-        temporary_path = backup_directory / f".{self.database_path.name}.backup-{uuid4().hex}.tmp"
+        return self._create_snapshot(self.database_path.name)
+
+    def backup_agent_database(self, session_stamp: str, sequence: int) -> Path:
+        """Create a snapshot of the state an Agent reply starts from.
+
+        Agent snapshots share the date folder with the manual backups but carry
+        their own marker and session stamp, so every run of the application can
+        remove exactly the files it created.
+
+        :param session_stamp: Marker of the running session, usually the moment
+            this process started.
+        :param sequence: One-based number of the snapshot inside the session.
+        :return: Path to the completed backup database.
+        :raises StorageError: If the snapshot cannot be created or verified.
+        """
+
+        suffix = self.database_path.suffix or ".sqlite3"
+        return self._create_snapshot(f"{AGENT_BACKUP_PREFIX}{session_stamp}-{sequence}{suffix}")
+
+    def remove_backups(self, paths: Iterable[Path]) -> list[Path]:
+        """Delete Agent snapshots and return the ones that could not be removed.
+
+        Only files carrying the Agent marker are considered, so a snapshot the
+        user created by hand is never deleted by a session cleanup.  A backup
+        folder left empty by the removal is dropped as well.
+
+        :param paths: Snapshot files to delete.
+        :return: The files that are still on disk.
+        """
+
+        remaining: list[Path] = []
+        for path in paths:
+            if not is_agent_backup(path):
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                remaining.append(path)
+                continue
+            try:
+                path.parent.rmdir()
+            except OSError:
+                # The folder still holds manual snapshots, or another process
+                # is using it; leaving it in place is harmless.
+                continue
+        return remaining
+
+    def _create_snapshot(self, file_name: str) -> Path:
+        """Copy the live database into the dated backup folder atomically."""
+
+        backup_directory = self.database_path.parent / datetime.now().strftime(BACKUP_DIRECTORY_FORMAT)
+        destination = backup_directory / file_name
+        temporary_path = backup_directory / f".{file_name}.backup-{uuid4().hex}.tmp"
         source_connection: sqlite3.Connection | None = None
         target_connection: sqlite3.Connection | None = None
         try:
@@ -493,6 +610,64 @@ class PromptRepository:
             except OSError as exc:
                 raise StorageError(f"无法清理未完成的数据库备份: {temporary_path}") from exc
 
+    def list_backups(self) -> list[Path]:
+        """Return the restorable snapshots of this database, newest first.
+
+        Only the date-named folders this application writes are considered, so
+        unrelated files in the data directory can never be offered as a backup.
+        The Agent snapshots inside those folders are listed next to the manual
+        ones, which is what lets the user undo an Agent change while the run
+        that produced it is still open.
+
+        :return: Snapshot paths; empty when no backup has been created yet.
+        :raises StorageError: If the data directory itself cannot be listed.
+        """
+
+        data_directory = self.database_path.parent
+        try:
+            entries = list(data_directory.iterdir())
+        except OSError as exc:
+            raise StorageError(f"无法读取数据库备份目录: {data_directory}") from exc
+        backups: list[tuple[int, str, Path]] = []
+        for entry in entries:
+            if not entry.is_dir() or _backup_day(entry.name) is None:
+                continue
+            for candidate in _snapshot_files(entry, self.database_path.name):
+                backups.append((_snapshot_time(candidate), candidate.name, candidate))
+        backups.sort(reverse=True)
+        return [path for _, _, path in backups]
+
+    def restore_database(self, backup_path: Path) -> Path:
+        """Replace the live database content with a verified snapshot.
+
+        The snapshot is copied through SQLite's online backup API, so the
+        active connection stays usable, committed WAL data is included, and a
+        failed copy leaves the previous content in place.  The schema is then
+        brought up to the current version, which keeps snapshots written by an
+        older release restorable.
+
+        :param backup_path: Snapshot created by :meth:`backup_database`.
+        :return: The snapshot path that was restored.
+        :raises StorageError: If the snapshot is missing, corrupt, outside the
+            data directory, or cannot be applied to the live database.
+        """
+
+        source_path = self._validated_backup_path(backup_path)
+        if not _contains_prompt_schema(source_path):
+            raise StorageError(f"备份文件不是有效的提示词数据库: {source_path.name}")
+        source_connection: sqlite3.Connection | None = None
+        try:
+            source_connection = _readonly_connection(source_path)
+            with self._lock:
+                source_connection.backup(self.connection, pages=1_000)
+                self._initialize_schema()
+        except (OSError, sqlite3.Error) as exc:
+            raise StorageError(f"无法从备份恢复数据库: {source_path}") from exc
+        finally:
+            if source_connection is not None:
+                source_connection.close()
+        return source_path
+
     def close(self) -> None:
         """Close the SQLite connection; safe to call more than once."""
 
@@ -500,6 +675,18 @@ class PromptRepository:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+
+    def _validated_backup_path(self, backup_path: Path) -> Path:
+        """Return the resolved snapshot path, rejecting unsafe restores."""
+
+        resolved = backup_path.expanduser().resolve()
+        if resolved == self.database_path.expanduser().resolve():
+            raise StorageError("不能把当前数据库当作备份恢复")
+        if not resolved.is_file():
+            raise StorageError(f"备份文件不存在: {backup_path}")
+        if self.database_path.parent.expanduser().resolve() not in resolved.parents:
+            raise StorageError(f"备份文件不在数据目录内: {backup_path}")
+        return resolved
 
     @staticmethod
     def _row_to_prompt(row: sqlite3.Row) -> Prompt:

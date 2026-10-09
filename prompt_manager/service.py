@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from .models import Prompt, PromptGroup
@@ -198,6 +198,37 @@ class PromptService:
         """Create and return a verified backup of the active local database."""
 
         return self.repository.backup_database()
+
+    def backup_agent_database(self, session_stamp: str, sequence: int) -> Path:
+        """Create a verified snapshot tagged as an Agent safety copy.
+
+        :param session_stamp: Marker of the running session.
+        :param sequence: One-based number of the snapshot inside the session.
+        :return: Path to the completed backup database.
+        :raises StorageError: If the snapshot cannot be created or verified.
+        """
+
+        return self.repository.backup_agent_database(session_stamp, sequence)
+
+    def remove_database_backups(self, paths: Iterable[Path]) -> list[Path]:
+        """Delete Agent snapshots and return the ones still on disk."""
+
+        return self.repository.remove_backups(paths)
+
+    def list_database_backups(self) -> list[Path]:
+        """Return the existing database snapshots, newest first."""
+
+        return self.repository.list_backups()
+
+    def restore_database(self, backup_path: Path) -> Path:
+        """Replace the active database with a verified snapshot.
+
+        :param backup_path: Snapshot returned by :meth:`list_database_backups`.
+        :return: The snapshot path that was restored.
+        :raises StorageError: If the snapshot cannot be applied.
+        """
+
+        return self.repository.restore_database(backup_path)
 
     def save_settings(self, settings: Mapping[str, str]) -> None:
         """Persist UI settings."""
