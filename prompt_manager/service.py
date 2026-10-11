@@ -5,12 +5,15 @@ from __future__ import annotations
 import os
 import re
 import sys
+import logging
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from .models import Prompt, PromptGroup
 from .placeholders import IMPORT_PATTERN, PlaceholderError, extract_imports, extract_placeholders, render_replacements
 from .storage import PromptRepository, StorageError
+
+logger = logging.getLogger(__name__)
 
 
 class ValidationError(ValueError):
@@ -50,7 +53,9 @@ class PromptService:
 
         clean_name, clean_content, clean_kind = self._validate_prompt(name, content, kind)
         try:
-            return self.repository.create_prompt(clean_name, clean_content, clean_kind)
+            prompt = self.repository.create_prompt(clean_name, clean_content, clean_kind)
+            logger.info("Prompt created id=%d kind=%s content_chars=%d", prompt.id, prompt.kind, len(clean_content))
+            return prompt
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -59,7 +64,9 @@ class PromptService:
 
         clean_name, clean_content, clean_kind = self._validate_prompt(name, content, kind)
         try:
-            return self.repository.update_prompt(prompt_id, clean_name, clean_content, clean_kind)
+            prompt = self.repository.update_prompt(prompt_id, clean_name, clean_content, clean_kind)
+            logger.info("Prompt updated id=%d kind=%s content_chars=%d", prompt.id, prompt.kind, len(clean_content))
+            return prompt
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -67,6 +74,7 @@ class PromptService:
         """Delete one prompt and its remembered values."""
 
         self.repository.delete_prompt(prompt_id)
+        logger.info("Prompt deleted id=%d", prompt_id)
 
     def list_groups(self, kind: str) -> list[PromptGroup]:
         """Return the first-level groups for one prompt category."""
@@ -80,7 +88,9 @@ class PromptService:
         clean_name = self._validate_group_name(name)
         self._validate_kind(kind)
         try:
-            return self.repository.create_group(clean_name, kind)
+            group = self.repository.create_group(clean_name, kind)
+            logger.info("Group created id=%d kind=%s", group.id, group.kind)
+            return group
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -89,7 +99,9 @@ class PromptService:
 
         clean_name = self._validate_group_name(name)
         try:
-            return self.repository.update_group(group_id, clean_name)
+            group = self.repository.update_group(group_id, clean_name)
+            logger.info("Group renamed id=%d kind=%s", group.id, group.kind)
+            return group
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -98,6 +110,7 @@ class PromptService:
 
         try:
             self.repository.delete_group(group_id)
+            logger.info("Group deleted id=%d", group_id)
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -115,6 +128,7 @@ class PromptService:
                 raise ValidationError("提示词只能加入同类别分组")
         try:
             self.repository.set_prompt_group(prompt_id, group_id)
+            logger.info("Prompt group changed id=%d group_id=%s", prompt_id, group_id)
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -123,6 +137,7 @@ class PromptService:
 
         try:
             self.repository.set_prompt_pinned(prompt_id, pinned)
+            logger.info("Prompt pin changed id=%d pinned=%s", prompt_id, pinned)
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -143,6 +158,7 @@ class PromptService:
             raise ValidationError("只能在同一分组或同一置顶区域内排序")
         try:
             self.repository.reorder_prompts(prompt_ids)
+            logger.info("Prompts reordered count=%d ids=%s", len(prompt_ids), prompt_ids)
         except StorageError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -171,6 +187,7 @@ class PromptService:
         """Persist current input values for future use."""
 
         self.repository.save_placeholder_values(prompt_id, values.items())
+        logger.debug("Placeholder values saved prompt_id=%d field_count=%d", prompt_id, len(values))
 
     def render(self, prompt: Prompt, values: Mapping[str, str]) -> str:
         """Expand imports recursively, then replace user-input markers."""
@@ -189,6 +206,20 @@ class PromptService:
 
         return render_replacements(expand(prompt.content, (prompt.name,)), values)
 
+    def render_with_remembered_values(self, prompt: Prompt) -> str:
+        """Expand imports and fill every replacement from saved values or empty text.
+
+        Imported fixed presets can contain replacement markers too. Expand
+        imports first so those markers receive the same title-based remembered
+        value as markers in the selected entry; missing values become empty.
+        """
+
+        expanded = self.render(prompt, {})
+        titles = self.placeholders_for(expanded)
+        remembered = self.remembered_values(prompt.id)
+        values = {title: remembered.get(title, "") for title in titles}
+        return render_replacements(expanded, values)
+
     def settings(self) -> dict[str, str]:
         """Return persisted UI settings."""
 
@@ -197,7 +228,9 @@ class PromptService:
     def backup_database(self) -> Path:
         """Create and return a verified backup of the active local database."""
 
-        return self.repository.backup_database()
+        path = self.repository.backup_database()
+        logger.info("Database backup created: %s", path)
+        return path
 
     def backup_agent_database(self, session_stamp: str, sequence: int) -> Path:
         """Create a verified snapshot tagged as an Agent safety copy.
@@ -208,12 +241,16 @@ class PromptService:
         :raises StorageError: If the snapshot cannot be created or verified.
         """
 
-        return self.repository.backup_agent_database(session_stamp, sequence)
+        path = self.repository.backup_agent_database(session_stamp, sequence)
+        logger.debug("Agent safety snapshot created sequence=%d path=%s", sequence, path)
+        return path
 
     def remove_database_backups(self, paths: Iterable[Path]) -> list[Path]:
         """Delete Agent snapshots and return the ones still on disk."""
 
-        return self.repository.remove_backups(paths)
+        remaining = self.repository.remove_backups(paths)
+        logger.debug("Agent snapshot cleanup incomplete=%d", len(remaining))
+        return remaining
 
     def list_database_backups(self) -> list[Path]:
         """Return the existing database snapshots, newest first."""
@@ -228,12 +265,15 @@ class PromptService:
         :raises StorageError: If the snapshot cannot be applied.
         """
 
-        return self.repository.restore_database(backup_path)
+        restored = self.repository.restore_database(backup_path)
+        logger.info("Database restored from %s", restored)
+        return restored
 
     def save_settings(self, settings: Mapping[str, str]) -> None:
         """Persist UI settings."""
 
         self.repository.save_settings(settings)
+        logger.debug("Settings saved key_count=%d", len(settings))
 
     def _validate_prompt(self, name: str, content: str, kind: str) -> tuple[str, str, str]:
         clean_name = name.strip()

@@ -7,9 +7,11 @@ import logging
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .icon import create_app_icon
+from .logging_setup import configure_logging, install_exception_hooks
 from .service import PromptService, default_data_directory, legacy_database_candidates
 from .storage import PromptRepository, StorageError, migrate_legacy_database
 from .ui import MainWindow
@@ -22,6 +24,24 @@ from .ui import MainWindow
 # release upgrades keep the same taskbar identity and pinned shortcuts keep
 # working.
 WINDOWS_APP_USER_MODEL_ID = "PromptManager.Desktop"
+
+
+def _log_qt_message(kind: QtMsgType, context: object, message: str) -> None:
+    """Record Qt diagnostics without copying user-controlled text into the log."""
+
+    levels = {
+        QtMsgType.QtDebugMsg: logging.DEBUG,
+        QtMsgType.QtInfoMsg: logging.INFO,
+        QtMsgType.QtWarningMsg: logging.WARNING,
+        QtMsgType.QtCriticalMsg: logging.ERROR,
+        QtMsgType.QtFatalMsg: logging.CRITICAL,
+    }
+    source = getattr(context, "file", None)
+    line = getattr(context, "line", 0)
+    logging.getLogger("prompt_manager.qt").log(
+        levels.get(kind, logging.INFO), "Qt diagnostic source=%s line=%s message_chars=%d",
+        Path(source).name if source else "unknown", line, len(message),
+    )
 
 
 def _configure_windows_taskbar_identity() -> None:
@@ -80,13 +100,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Start the GUI and return its process exit code."""
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = build_parser().parse_args(argv)
+    data_dir = (args.data_dir or default_data_directory()).expanduser()
+    configure_logging(data_dir)
+    install_exception_hooks()
+    qInstallMessageHandler(_log_qt_message)
+    logging.info("Application starting; database directory=%s", data_dir)
     # The AppUserModelID must be installed before the first top-level window
     # is shown; otherwise the taskbar button is created against the default
     # (exe-derived) identity and will not pick up the window icon.
     _configure_windows_taskbar_identity()
-    args = build_parser().parse_args(argv)
-    data_dir = (args.data_dir or default_data_directory()).expanduser()
     database_path = data_dir / "prompts.sqlite3"
     # argparse owns the application options; do not let Qt reinterpret them.
     application = QApplication([sys.argv[0]])
@@ -108,9 +131,11 @@ def main(argv: list[str] | None = None) -> int:
     service = PromptService(repository)
     window = MainWindow(service)
     window.show()
+    logging.info("Main window shown")
     try:
         return application.exec()
     finally:
+        logging.info("Application exiting")
         repository.close()
 
 

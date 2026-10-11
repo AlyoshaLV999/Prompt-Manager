@@ -54,6 +54,21 @@ def provider_config(settings: Mapping[str, str], provider: str) -> tuple[str, st
         settings.get(f"agent_{provider}_model", settings.get("agent_model", default_model) if legacy else default_model),
     )
 
+
+def provider_api_key(settings: Mapping[str, str], provider: str) -> str:
+    """Read a saved key, accepting the legacy shared key for its active provider only.
+
+    An explicitly saved empty provider key overrides the legacy value, so a
+    user can clear a previously configured key without it reappearing.
+    """
+
+    specific_key = f"agent_{provider}_api_key"
+    if specific_key in settings:
+        return settings[specific_key]
+    if settings.get("agent_provider", "openai") == provider:
+        return settings.get("agent_api_key", "")
+    return ""
+
 AGENT_TOOLS: list[dict[str, Any]] = [
     {"type": "function", "function": {"name": "list_prompts", "description": "List saved prompts, optionally filtered by kind.", "parameters": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["prompt", "fixed"]}}, "additionalProperties": False}}},
     {"type": "function", "function": {"name": "read_prompt", "description": "Read one saved prompt by its numeric ID.", "parameters": {"type": "object", "properties": {"prompt_id": {"type": "integer"}}, "required": ["prompt_id"], "additionalProperties": False}}},
@@ -115,6 +130,7 @@ def request_completion(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+    logger.debug("Agent transport request started messages=%d payload_bytes=%d", len(messages), len(payload))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             content_type = response.headers.get("Content-Type", "").lower()
@@ -135,11 +151,14 @@ def request_completion(
                 on_delta(content)
             return AgentResponse(content, calls)
     except urllib.error.HTTPError as exc:
+        logger.warning("Agent transport HTTP failure status=%d", exc.code)
         detail = exc.read(2048).decode("utf-8", errors="replace")
         raise AgentRequestError(f"模型服务返回 HTTP {exc.code}: {detail}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logger.warning("Agent transport connection failure error=%s", type(exc).__name__)
         raise AgentRequestError(f"无法连接模型服务: {exc}") from exc
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+        logger.warning("Agent transport invalid response error=%s", type(exc).__name__)
         raise AgentRequestError(f"模型服务返回的数据格式无效: {exc}") from exc
 
 
@@ -360,8 +379,8 @@ def fetch_glm_models(
     except urllib.error.HTTPError as exc:
         logger.debug("GLM model list request returned HTTP %d; falling back to built-in list", exc.code)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logger.debug("GLM model list request failed: %s; falling back to built-in list", exc)
+        logger.debug("GLM model list request failed error=%s; falling back to built-in list", type(exc).__name__)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        logger.debug("GLM model list response invalid: %s; falling back to built-in list", exc)
+        logger.debug("GLM model list response invalid error=%s; falling back to built-in list", type(exc).__name__)
 
     return list(dict.fromkeys(remote_names)) if remote_names else list(GLM_KNOWN_MODELS)

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import logging
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 from .models import Prompt, PromptGroup
+
+logger = logging.getLogger(__name__)
 
 # Snapshots written by :meth:`PromptRepository.backup_database` live in one
 # folder per day.  The folder name is both what identifies a backup directory
@@ -205,7 +208,9 @@ class PromptRepository:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._initialize_schema()
+            logger.info("Database opened path=%s schema_version=%d", self.database_path, self.SCHEMA_VERSION)
         except (OSError, sqlite3.Error) as exc:
+            logger.error("Database open failed path=%s error=%s", self.database_path, type(exc).__name__)
             self.close()
             raise StorageError(f"无法打开提示词数据库: {self.database_path}") from exc
 
@@ -675,6 +680,7 @@ class PromptRepository:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+                logger.info("Database connection closed path=%s", self.database_path)
 
     def _validated_backup_path(self, backup_path: Path) -> Path:
         """Return the resolved snapshot path, rejecting unsafe restores."""

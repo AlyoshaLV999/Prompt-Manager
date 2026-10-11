@@ -88,7 +88,11 @@ class DatabaseTaskThread(QThread):
         try:
             result = self._task()
         except StorageError as exc:
+            logger.warning("Database worker task failed error=%s", type(exc).__name__)
             self.completed.emit(None, str(exc))
+        except Exception:
+            logger.exception("Unexpected database worker failure")
+            raise
         else:
             self.completed.emit(result, "")
 

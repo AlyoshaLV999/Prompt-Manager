@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .agent import PROVIDER_DEFAULTS, AgentRequestError, provider_config, request_completion
+from .agent import PROVIDER_DEFAULTS, AgentRequestError, provider_api_key, provider_config, request_completion
 
 logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 8
@@ -95,14 +95,20 @@ class _CompletionThread(QThread):
                 pending_size = 0
 
         try:
+            logger.info("Agent worker started request_id=%d messages=%d", id(self), len(self.messages))
             result = request_completion(
                 self.base_url, self.model, self.api_key, self.messages,
                 on_delta=receive, should_cancel=self.isInterruptionRequested,
             )
         except AgentRequestError as exc:
+            logger.warning("Agent worker failed request_id=%d error=%s", id(self), type(exc).__name__)
             flush()
             self.completed.emit(None, str(exc))
+        except Exception:
+            logger.exception("Unexpected Agent worker failure request_id=%d", id(self))
+            raise
         else:
+            logger.info("Agent worker finished request_id=%d reply_chars=%d tool_calls=%d", id(self), len(result.content), len(result.tool_calls))
             flush()
             self.completed.emit(result, "")
 
@@ -474,6 +480,7 @@ class AgentPanel(QWidget):
                 self._attachments.append(path)
                 added += 1
         self._refresh_attachment_label()
+        logger.info("User queued Agent attachments added=%d rejected=%d total=%d", added, len(rejected), len(self._attachments))
         if rejected:
             self.status_label.setText("已忽略：" + "、".join(rejected))
         elif added:
@@ -492,6 +499,7 @@ class AgentPanel(QWidget):
                 self.clear_attachments_button.setVisible(False)
 
     def _clear_attachments(self) -> None:
+        logger.info("User cleared Agent attachments count=%d", len(self._attachments))
         self._attachments.clear()
         self._refresh_attachment_label()
 
@@ -536,8 +544,10 @@ class AgentPanel(QWidget):
         try:
             attachment_context = self._attachment_context()
         except ValueError as exc:
+            logger.warning("Agent attachment validation failed count=%d error=%s", len(self._attachments), type(exc).__name__)
             self.status_label.setText(str(exc))
             return
+        logger.info("User submitted Agent message chars=%d attachment_count=%d", len(content), len(self._attachments))
         display_content = content
         if attachment_context:
             attachment_message = "请结合以下附件内容回答：\n\n" + attachment_context
@@ -567,6 +577,7 @@ class AgentPanel(QWidget):
         thread = self._thread
         if thread is None and self._pending_calls is None:
             return
+        logger.info("User stopped Agent generation request_id=%s", id(thread) if thread is not None else "-")
         self._thread = None
         if thread is not None:
             thread.requestInterruption()
@@ -595,6 +606,7 @@ class AgentPanel(QWidget):
     def clear_conversation(self) -> None:
         """Discard the whole conversation so the model keeps no memory of it."""
 
+        logger.info("User cleared Agent conversation message_count=%d", len(self.messages))
         self.stop_generation()
         self.messages.clear()
         self._transcript_entries.clear()
@@ -617,6 +629,7 @@ class AgentPanel(QWidget):
 
         if self._thread is not None or self._pending_calls is not None or self._retry_message_count is None:
             return
+        logger.info("User retried last Agent message history_count=%d", self._retry_message_count)
         del self.messages[self._retry_message_count:]
         if self._retry_transcript_count is not None:
             del self._transcript_entries[self._retry_transcript_count:]
@@ -649,12 +662,13 @@ class AgentPanel(QWidget):
         if provider not in PROVIDER_DEFAULTS:
             provider = "openai"
         base_url, model = provider_config(settings, provider)
-        key = getattr(self.main_window, "_agent_api_keys", {}).get(provider, "")
-        if not key and not hasattr(self.main_window, "_agent_api_keys"):
-            key = getattr(self.main_window, "_agent_api_key", "")
+
+        key = provider_api_key(settings, provider)
+
         env_key = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY", "glm": "GLM_API_KEY"}.get(provider)
         key = key or (os.environ.get(env_key, "") if env_key else "")
         thread = _CompletionThread(base_url.strip(), model.strip(), key, [SYSTEM_MESSAGE, *self.messages[-MAX_HISTORY_MESSAGES:]])
+        logger.info("Agent request prepared request_id=%d provider=%s history_count=%d tool_round=%d", id(thread), provider, len(thread.messages), self._tool_rounds)
         self._stream_section = None
         self._stream_parts.clear()
         self._progress_section = self._append_transcript("系统", "正在请求模型…", collapsed=False)
@@ -701,6 +715,7 @@ class AgentPanel(QWidget):
         thread = self.sender()
         if thread is not None and thread is not self._thread:
             # A stopped or replaced request answered late; drop its result.
+            logger.debug("Ignored late Agent response request_id=%d", id(thread))
             return
         if self._thread is not None:
             self._thread.wait()
@@ -710,11 +725,12 @@ class AgentPanel(QWidget):
             self._finish_progress("模型请求失败")
             self._finalize_stream()
             self.status_label.setText("请求失败")
-            logger.warning("Agent model request failed")
+            logger.warning("Agent model request failed request_id=%s", id(thread) if thread is not None else "-")
             self._append_transcript("系统", error)
             return
         self._finish_progress("模型响应已完成")
         calls = response.tool_calls
+        logger.info("Agent response accepted request_id=%s reply_chars=%d tool_calls=%d", id(thread) if thread is not None else "-", len(response.content), len(calls))
         assistant_message: dict[str, Any] = {"role": "assistant", "content": response.content or None}
         if calls:
             assistant_message["tool_calls"] = calls
@@ -744,6 +760,7 @@ class AgentPanel(QWidget):
             self._pending_calls = None
             self._active_tool_section = None
             if self._tool_rounds >= MAX_TOOL_ROUNDS:
+                logger.warning("Agent tool round limit reached rounds=%d", self._tool_rounds)
                 self._append_transcript("系统", "Agent 达到本轮工具调用上限，请继续发送消息。")
                 self.status_label.setText("就绪")
                 self._set_running(False)
@@ -778,6 +795,7 @@ class AgentPanel(QWidget):
                 raise ValueError("工具参数必须是 JSON 对象")
             result = self.main_window.execute_agent_tool(name, arguments)
         except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Agent tool arguments rejected error=%s", type(exc).__name__)
             result = {"error": str(exc)}
         self._update_transcript_section(
             section, f"{name}:\n```json\n{json.dumps(result, ensure_ascii=False, indent=2)}\n```"
@@ -790,6 +808,7 @@ class AgentPanel(QWidget):
         if thread is None:
             return
         self._worker_threads = [item for item in self._worker_threads if item is not thread]
+        logger.debug("Agent worker thread released request_id=%d", id(thread))
         thread.deleteLater()
 
     def _append_transcript(self, speaker: str, content: str,
