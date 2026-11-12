@@ -10,8 +10,8 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from .database_maintenance import DatabaseTaskThread, RestoreDatabaseDialog
-from .agent import AGENT_TOOLS
+from .database_maintenance import DatabaseTaskThread, OllamaStopThread, RestoreDatabaseDialog
+from .agent import AGENT_TOOLS, provider_config
 from .models import Prompt
 from .service import ValidationError
 from .storage import StorageError
@@ -73,6 +73,69 @@ class MainWindowActions:
         self._database_thread.completed.connect(self._on_database_backup_completed)
         self._database_thread.finished.connect(self._on_database_task_finished)
         self._database_thread.start()
+
+    def start_ollama_model_unload(self) -> None:
+        """Release the active Ollama model from memory without deleting it."""
+
+        if self._database_thread is not None or self._ollama_stop_thread is not None:
+            return
+        try:
+            settings = self.service.settings()
+        except StorageError as exc:
+            logger.warning("Ollama model settings read failed error=%s", type(exc).__name__)
+            message = f"无法读取 Ollama 设置：{exc}"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 6000)
+            return
+        if settings.get("agent_provider", "openai") != "ollama":
+            message = "当前 Agent 服务商不是 Ollama，未执行卸载"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 4000)
+            return
+        _, model = provider_config(settings, "ollama")
+        model = model.strip()
+        if not model:
+            message = "当前 Ollama 模型名称为空，未执行卸载"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 4000)
+            return
+
+        logger.info("User requested Ollama model unload model=%s", model)
+        self.agent_panel.set_database_actions_enabled(False)
+        self.agent_panel.status_label.setText(f"正在从显存卸载 Ollama 模型 {model}…")
+        thread = OllamaStopThread(model)
+        thread.completed.connect(self._on_ollama_model_unload_completed)
+        thread.finished.connect(self._on_ollama_stop_thread_finished)
+        self._ollama_stop_thread = thread
+        thread.start()
+
+    def _on_ollama_model_unload_completed(self, model: str, error: str) -> None:
+        """Report the result of releasing the selected Ollama model."""
+
+        if error:
+            logger.warning("Ollama model unload failed: %s", error)
+            message = f"Ollama 模型卸载失败：{error}"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 6000)
+            return
+        if not model:
+            logger.error("Ollama stop worker returned no model")
+            message = "Ollama 模型卸载失败：未返回模型名称"
+            self.agent_panel.status_label.setText(message)
+            self.statusBar().showMessage(message, 6000)
+            return
+        message = f"已从显存卸载 Ollama 模型：{model}；下次发送 Agent 消息时会自动重新加载"
+        self.agent_panel.status_label.setText(message)
+        self.statusBar().showMessage(message, 6000)
+
+    def _on_ollama_stop_thread_finished(self) -> None:
+        """Release the Ollama worker and restore maintenance controls."""
+
+        thread = self.sender()
+        self._ollama_stop_thread = None
+        self.agent_panel.set_database_actions_enabled(self._database_thread is None)
+        if thread is not None:
+            thread.deleteLater()
 
     def start_database_restore(self) -> None:
         """Replace the live database with a snapshot chosen by the user.
@@ -148,7 +211,7 @@ class MainWindowActions:
     def _on_database_task_finished(self) -> None:
         thread = self.sender()
         self._database_thread = None
-        self.agent_panel.set_database_actions_enabled(True)
+        self.agent_panel.set_database_actions_enabled(self._ollama_stop_thread is None)
         if thread is not None:
             thread.deleteLater()
 

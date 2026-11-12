@@ -36,9 +36,10 @@ class DragExportError(OSError):
 class PromptDragExportManager(QObject):
     """Own temporary Markdown exports for prompt-list drag operations.
 
-    Exports live beside the application log in a dedicated directory. The
-    database remains the source of truth; files exist only to provide a local
-    file URL to applications that accept dragged files.
+    Exports live beside the application log in a dedicated directory. Prompt
+    entries use per-item directories so each dragged file can be named
+    ``prompt.md`` without overwriting another entry's content. The database
+    remains the source of truth; files only provide local drag URLs.
     """
 
     def __init__(self, service: PromptService, log_directory: Path, retention_minutes: int,
@@ -71,7 +72,7 @@ class PromptDragExportManager(QObject):
     def export_prompt(self, prompt_id: int) -> Path:
         """Write a prompt's current Markdown content and return its file path.
 
-        Repeated drags of the same named entry replace its previous export.
+        Repeated drags of the same entry replace its previous export.
 
         :param prompt_id: Database identifier of the saved prompt.
         :return: Absolute path of the temporary Markdown file.
@@ -84,7 +85,12 @@ class PromptDragExportManager(QObject):
         try:
             content = self._service.render_with_remembered_values(prompt)
             self._ensure_directory()
-            target = self.directory / f"{self._safe_stem(prompt.name, prompt_id)}.md"
+            if prompt.is_fixed:
+                target = self.directory / f"{self._safe_stem(prompt.name, prompt_id)}.md"
+            else:
+                export_directory = self.directory / f"prompt-{prompt.id}"
+                self._ensure_directory(export_directory)
+                target = export_directory / "prompt.md"
             temporary = self.directory / f".{uuid4().hex}.tmp"
             try:
                 with temporary.open("x", encoding="utf-8", newline="") as output:
@@ -133,12 +139,27 @@ class PromptDragExportManager(QObject):
                     if path.is_symlink():
                         if path.lstat().st_mtime < cutoff:
                             path.unlink()
+                    elif path.is_dir():
+                        self._clean_item_directory(path, cutoff)
                     elif path.is_file() and path.stat().st_mtime < cutoff:
                         path.unlink()
                 except OSError as exc:
                     logger.warning("Cannot remove expired drag export path=%s error=%s", path.name, type(exc).__name__)
         except OSError as exc:
             logger.warning("Cannot scan drag export directory error=%s", type(exc).__name__)
+
+    @staticmethod
+    def _clean_item_directory(directory: Path, cutoff: float | None) -> None:
+        """Remove expired files in one item directory and discard it when empty."""
+
+        for path in directory.iterdir():
+            if path.is_symlink():
+                if cutoff is None or path.lstat().st_mtime < cutoff:
+                    path.unlink()
+            elif path.is_file() and (cutoff is None or path.stat().st_mtime < cutoff):
+                path.unlink()
+        if not any(directory.iterdir()):
+            directory.rmdir()
 
     def shutdown(self) -> None:
         """Stop periodic cleanup and remove all remaining temporary exports."""
@@ -154,17 +175,20 @@ class PromptDragExportManager(QObject):
                 try:
                     if path.is_symlink() or path.is_file():
                         path.unlink()
+                    elif path.is_dir():
+                        self._clean_item_directory(path, None)
                 except OSError as exc:
                     logger.warning("Cannot remove drag export at shutdown path=%s error=%s", path.name, type(exc).__name__)
             self.directory.rmdir()
         except OSError as exc:
             logger.warning("Cannot clean drag export directory at shutdown error=%s", type(exc).__name__)
 
-    def _ensure_directory(self) -> None:
+    def _ensure_directory(self, directory: Path | None = None) -> None:
         """Create a private export directory and refuse symlink redirection."""
 
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if self.directory.is_symlink() or not self.directory.is_dir():
+        directory = self.directory if directory is None else directory
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
             raise OSError("临时文件目录不是普通目录")
         if os.name != "nt":
-            self.directory.chmod(0o700)
+            directory.chmod(0o700)

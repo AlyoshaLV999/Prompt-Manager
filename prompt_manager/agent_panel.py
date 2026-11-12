@@ -378,6 +378,11 @@ class AgentPanel(QWidget):
         self.restore_button.setToolTip("从已有备份中选择一个，覆盖当前数据库并刷新界面")
         self.restore_button.clicked.connect(self.main_window.start_database_restore)
         header_layout.addWidget(self.restore_button)
+        self.unload_ollama_button = QPushButton("卸载 Ollama 模型")
+        self.unload_ollama_button.setToolTip("仅从显存卸载当前 Ollama 模型，不删除模型；下次发送消息时会自动加载")
+        self.unload_ollama_button.setAccessibleName("从显存卸载当前 Ollama 模型")
+        self.unload_ollama_button.clicked.connect(self.main_window.start_ollama_model_unload)
+        header_layout.addWidget(self.unload_ollama_button)
         layout.addWidget(header)
 
         panel = QWidget()
@@ -435,10 +440,11 @@ class AgentPanel(QWidget):
         self.setMaximumWidth(460)
 
     def set_database_actions_enabled(self, enabled: bool) -> None:
-        """Enable or disable both snapshot actions while one of them runs."""
+        """Enable or disable database and Ollama maintenance actions."""
 
         self.backup_button.setEnabled(enabled)
         self.restore_button.setEnabled(enabled)
+        self.unload_ollama_button.setEnabled(enabled)
 
     def shutdown(self) -> None:
         """Stop generation and wait briefly for the detached workers."""
@@ -665,7 +671,12 @@ class AgentPanel(QWidget):
 
         key = provider_api_key(settings, provider)
 
-        env_key = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY", "glm": "GLM_API_KEY"}.get(provider)
+        env_key = {
+            "openai": "OPENAI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "glm": "GLM_API_KEY",
+        }.get(provider)
         key = key or (os.environ.get(env_key, "") if env_key else "")
         thread = _CompletionThread(base_url.strip(), model.strip(), key, [SYSTEM_MESSAGE, *self.messages[-MAX_HISTORY_MESSAGES:]])
         logger.info("Agent request prepared request_id=%d provider=%s history_count=%d tool_round=%d", id(thread), provider, len(thread.messages), self._tool_rounds)

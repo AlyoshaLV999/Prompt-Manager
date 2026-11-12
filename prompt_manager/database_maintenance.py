@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
+
+from .agent import OllamaStopError, stop_ollama_model
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -68,6 +70,29 @@ class AgentBackupSession:
                 "Failed to remove %d Agent snapshot(s), for example %s",
                 len(remaining), remaining[0],
             )
+
+
+class OllamaStopThread(QThread):
+    """Stop one selected Ollama model without blocking the GUI thread."""
+
+    completed = Signal(str, str)
+
+    def __init__(self, model: str) -> None:
+        super().__init__()
+        self.model = model
+
+    def run(self) -> None:
+        try:
+            stop_ollama_model(self.model)
+        except OllamaStopError as exc:
+            logger.warning("Ollama model stop failed model=%s error=%s", self.model, type(exc).__name__)
+            self.completed.emit("", str(exc))
+        except Exception:
+            logger.exception("Unexpected Ollama model stop failure model=%s", self.model)
+            self.completed.emit("", "卸载 Ollama 模型时发生未预期错误")
+        else:
+            logger.info("Ollama model stopped model=%s", self.model)
+            self.completed.emit(self.model, "")
 
 
 class DatabaseTaskThread(QThread):

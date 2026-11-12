@@ -26,7 +26,7 @@ logger = logging.getLogger(f"{__package__}.ui")
 
 
 class _ModelFetchThread(QThread):
-    """Query a model provider (Ollama or GLM) for available models."""
+    """Query a model provider that exposes a model discovery endpoint."""
 
     completed = Signal(object, str)
 
@@ -141,9 +141,11 @@ class SettingsDialog(QDialog):
         agent_form = QFormLayout(agent_page)
         self.agent_provider_edit = QComboBox()
         self.agent_provider_edit.addItem("OpenAI", "openai")
+        self.agent_provider_edit.addItem("OpenRouter", "openrouter")
         self.agent_provider_edit.addItem("Ollama", "ollama")
         self.agent_provider_edit.addItem("Gemini", "gemini")
         self.agent_provider_edit.addItem("GLM", "glm")
+        self.agent_provider_edit.addItem("自定义（OpenAI 兼容）", "custom")
         provider = settings.get("agent_provider", "openai")
         if provider not in PROVIDER_DEFAULTS:
             provider = "openai"
@@ -169,7 +171,7 @@ class SettingsDialog(QDialog):
 
         self.agent_api_key_edit = QLineEdit()
         self.agent_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.agent_api_key_edit.setPlaceholderText("留空时读取 OPENAI_API_KEY / GEMINI_API_KEY / GLM_API_KEY")
+        self.agent_api_key_edit.setPlaceholderText("留空时读取对应服务商的环境变量（自定义服务商除外）")
         api_key = self._provider_config[provider]["api_key"]
         self.agent_api_key_edit.setText(api_key)
         agent_form.addRow("API Key（持久化保存）", self.agent_api_key_edit)
@@ -183,6 +185,7 @@ class SettingsDialog(QDialog):
             "API Key 会持久化保存到本地数据库，关闭程序后仍然可用。"
             "如果您有多个服务商的 Key，请分别保存。"
             "Gemini 使用 OpenAI 兼容接口。GLM 使用智谱 AI 平台 OpenAI 兼容接口。"
+            "OpenRouter 和自定义服务商使用 OpenAI 兼容接口；自定义服务商需填写 API 地址与模型名称。"
             "Ollama 模型列表通过本机 /api/tags 获取；GLM 提供模型建议，填写 Key 后可获取服务端列表。"
         )
         tip.setObjectName("Hint")
@@ -233,7 +236,7 @@ class SettingsDialog(QDialog):
         self._set_model_options(GLM_KNOWN_MODELS if target_provider == "glm" else [])
         self.model_status_label.setText("可选择建议模型，或输入自己的模型名称" if target_provider == "glm" else "")
 
-        # Fetch models if Ollama or GLM is selected.
+        # Fetch models only for providers with a supported discovery endpoint.
         if target_provider in ("ollama", "glm"):
             self._refresh_agent_models()
 

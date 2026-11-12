@@ -24,7 +24,9 @@ from .agent import (
     fetch_glm_models, fetch_ollama_models, provider_config,
 )
 from .agent_panel import AgentPanel
-from .database_maintenance import AgentBackupSession, DatabaseTaskThread, RestoreDatabaseDialog
+from .database_maintenance import (
+    AgentBackupSession, DatabaseTaskThread, OllamaStopThread, RestoreDatabaseDialog,
+)
 from .drag_exports import DEFAULT_RETENTION_MINUTES, MAX_RETENTION_MINUTES, MIN_RETENTION_MINUTES, PromptDragExportManager
 from .models import Prompt
 from .service import PromptService, ValidationError
@@ -106,6 +108,7 @@ class MainWindow(MainWindowListActions, MainWindowActions, QMainWindow):
         self.setStyleSheet(APP_STYLESHEET)
         self._build_ui()
         self._database_thread: DatabaseTaskThread | None = None
+        self._ollama_stop_thread: OllamaStopThread | None = None
         self._install_shortcuts()
         self.refresh_prompt_list()
         # Application-level filter is required because the double Shift
@@ -832,6 +835,8 @@ class MainWindow(MainWindowListActions, MainWindowActions, QMainWindow):
             application.removeEventFilter(self)
         if self._database_thread is not None and self._database_thread.isRunning():
             self._database_thread.wait()
+        if self._ollama_stop_thread is not None and self._ollama_stop_thread.isRunning():
+            self._ollama_stop_thread.wait()
         self.agent_panel.shutdown()
         self._agent_backups.discard()
         self._autosave_timer.stop()

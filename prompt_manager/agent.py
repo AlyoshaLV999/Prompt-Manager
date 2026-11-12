@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -14,12 +17,16 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_DEFAULTS: dict[str, tuple[str, str]] = {
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
+    "openrouter": ("https://openrouter.ai/api/v1", "openai/gpt-4o-mini"),
     "ollama": ("http://localhost:11434/v1", "qwen2.5:7b"),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.0-flash"),
     "glm": ("https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
+    # Generic OpenAI-compatible endpoint; users supply its URL and model.
+    "custom": ("", ""),
 }
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 OLLAMA_MODEL_LIST_TIMEOUT = 10.0
+OLLAMA_STOP_TIMEOUT = 30.0
 GLM_MODEL_LIST_TIMEOUT = 10.0
 
 GLM_KNOWN_MODELS: list[str] = [
@@ -93,6 +100,10 @@ class AgentResponse:
 
 class AgentRequestError(RuntimeError):
     """Raised when an OpenAI-compatible Agent request cannot be completed."""
+
+
+class OllamaStopError(RuntimeError):
+    """Raised when the selected Ollama model cannot be stopped."""
 
 
 def request_completion(
@@ -319,6 +330,65 @@ def fetch_ollama_models(base_url: str, *, timeout: float = OLLAMA_MODEL_LIST_TIM
             seen.add(name)
             names.append(name)
     return names
+
+
+def stop_ollama_model(model: str, *, timeout: float = OLLAMA_STOP_TIMEOUT) -> None:
+    """Stop one Ollama model through PowerShell to release its GPU memory.
+
+    The model remains installed.  The model name is passed through an
+    environment variable so it is treated as data rather than PowerShell
+    syntax.  Ollama will load the same model again when the next Agent request
+    uses it.
+
+    :param model: Model identifier selected in the active Ollama settings.
+    :param timeout: Maximum number of seconds to wait for PowerShell.
+    :raises OllamaStopError: If PowerShell or Ollama is unavailable, the
+        command times out, or Ollama reports a failure.
+    """
+
+    selected_model = model.strip()
+    if not selected_model:
+        raise OllamaStopError("请在设置中填写 Ollama 模型名称")
+    if any(ord(character) < 32 for character in selected_model):
+        raise OllamaStopError("Ollama 模型名称包含无效控制字符")
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        raise OllamaStopError("未找到 PowerShell，无法执行 Ollama 卸载命令")
+
+    environment = os.environ.copy()
+    environment["PROMPT_MANAGER_OLLAMA_MODEL"] = selected_model
+    command = [
+        powershell,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "ollama stop $env:PROMPT_MANAGER_OLLAMA_MODEL",
+    ]
+    run_options: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": timeout,
+        "check": False,
+        "env": environment,
+    }
+    if os.name == "nt":
+        run_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(command, **run_options)
+    except subprocess.TimeoutExpired as exc:
+        raise OllamaStopError(f"卸载 Ollama 模型超时（超过 {timeout:g} 秒）") from exc
+    except OSError as exc:
+        raise OllamaStopError(f"无法启动 PowerShell 执行 Ollama 命令：{exc}") from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if len(detail) > 512:
+            detail = detail[:512] + "…"
+        suffix = f"：{detail}" if detail else ""
+        raise OllamaStopError(f"Ollama 卸载模型失败（退出码 {result.returncode}）{suffix}")
 
 
 def fetch_glm_models(
